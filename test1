@@ -1,117 +1,19 @@
-# Define the list of files to execute without arguments
-$files = @(
-    @{ Path = "C:\Path\To\SetupScript1.bat"; Args = "" },
-    @{ Path = "C:\Path\To\SetupScript2.bat"; Args = "" }
-)
+foreach ($file in $files) {
+    try {
+        Write-Output "Executing $($file.Path) with arguments $($file.Args)"
+        $command = "& `"$($file.Path)`" $($file.Args)"
+        Write-Output "Command: $command" | Out-File -Append -FilePath C:\Path\To\CommandLog.log
 
-# Add dynamic runs for Command1 through Command8
-for ($i = 1; $i -le 8; $i++) {
-    $files += @{
-        Path = "D:\Alliance\Access\BSS\bin\win64\messageTool.exe"; 
-        Args = "-r CRIOPER$i -c"
-    }
-}
-
-# Add dynamic runs for Command9 through Command16
-for ($i = 1; $i -le 8; $i++) {
-    $files += @{
-        Path = "C:\Path\To\Executable2.exe"; 
-        Args = "ARG$i"
-    }
-}
-
-# Append the required directory to PATH
-Write-Output "Appending D:\Alliance\Access\BSS\bin\win64 to PATH"
-$env:PATH += ";D:\Alliance\Access\BSS\bin\win64"
-
-# Execute the files and service management in the desired order
-try {
-    # Step 1: Execute Initial Setup commands
-    foreach ($file in $files[0..1]) {
-        Write-Output "Executing $($file.Path)"
-        & "$($file.Path)"
+        # Execute the command
+        & "$($file.Path)" $file.Args.Split(' ')
 
         # Check the exit code
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
             throw "Execution aborted due to failure."
         }
-    }
-
-    # Step 2: Stop the Windows Service inline
-    try {
-        Write-Output "Stopping service: SERVICE_NAME"
-        Stop-Service -Name "SERVICE_NAME" -Force -ErrorAction Stop
-        Write-Output "Service SERVICE_NAME stopped successfully."
     } catch {
-        Write-Error "Failed to stop service SERVICE_NAME: $_.Exception.Message"
-        throw $_  # Abort the script on failure
+        Write-Error "Exception occurred while executing $($file.Path): $_.Exception.Message"
+        throw $_
     }
-
-    # Step 3: Execute Command1 through Command8
-    foreach ($file in $files[2..9]) {  # Commands 1 to 8
-        Write-Output "Executing $($file.Path) with arguments $($file.Args)"
-
-        # Save the current location
-        $originalLocation = Get-Location
-
-        # Change to the directory containing the executable
-        Set-Location -Path (Split-Path -Path $file.Path)
-
-        try {
-            # Run the executable with arguments
-            & ".\$(Split-Path -Leaf $file.Path)" $file.Args.Split(' ')
-
-            # Check the exit code
-            if ($LASTEXITCODE -ne 0) {
-                Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
-                throw "Execution aborted due to failure."
-            }
-        } finally {
-            # Restore the original location
-            Set-Location -Path $originalLocation
-        }
-    }
-
-    # Step 4: Start the Windows Service inline
-    try {
-        Write-Output "Starting service: SERVICE_NAME"
-        Start-Service -Name "SERVICE_NAME" -ErrorAction Stop
-        Write-Output "Service SERVICE_NAME started successfully."
-    } catch {
-        Write-Error "Failed to start service SERVICE_NAME: $_.Exception.Message"
-        throw $_  # Abort the script on failure
-    }
-
-    # Step 5: Execute Command9 through Command16
-    foreach ($file in $files[10..17]) {  # Commands 9 to 16
-        Write-Output "Executing $($file.Path) with arguments $($file.Args)"
-
-        # Save the current location
-        $originalLocation = Get-Location
-
-        # Change to the directory containing the executable
-        Set-Location -Path (Split-Path -Path $file.Path)
-
-        try {
-            # Run the executable with arguments
-            & ".\$(Split-Path -Leaf $file.Path)" $file.Args.Split(' ')
-
-            # Check the exit code
-            if ($LASTEXITCODE -ne 0) {
-                Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
-                throw "Execution aborted due to failure."
-            }
-        } finally {
-            # Restore the original location
-            Set-Location -Path $originalLocation
-        }
-    }
-
-    Write-Output "Message Completion and Queue Release activity completed successfully."
-
-} catch {
-    # Log the exception and abort
-    Write-Error "Exception occurred: $_.Exception.Message"
-    throw $_
 }
