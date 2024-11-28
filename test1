@@ -1,11 +1,16 @@
 foreach ($file in $files) {
     try {
         Write-Output "Executing $($file.Path) with arguments $($file.Args)"
-        $command = "& `"$($file.Path)`" $($file.Args)"
+        
+        # Split the arguments string into an array
+        $argsArray = $file.Args.Split(' ')
+        
+        # Log the exact command being executed
+        $command = "& `"$($file.Path)`" $($argsArray -join ' ')"
         Write-Output "Command: $command" | Out-File -Append -FilePath C:\Path\To\CommandLog.log
 
-        # Execute the command
-        & "$($file.Path)" $file.Args.Split(' ')
+        # Execute the command with split arguments
+        & "$($file.Path)" $argsArray
 
         # Check the exit code
         if ($LASTEXITCODE -ne 0) {
