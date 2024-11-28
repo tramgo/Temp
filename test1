@@ -7,8 +7,8 @@ $files = @(
 # Add dynamic runs for Command1 through Command8
 for ($i = 1; $i -le 8; $i++) {
     $files += @{
-        Path = "C:\Path\To\Executable1.exe"; 
-        Args = "ARG$i"
+        Path = "D:\Alliance\Access\BSS\bin\win64\messageTool.exe"; 
+        Args = "-r CRIOPER$i -c"
     }
 }
 
@@ -20,12 +20,16 @@ for ($i = 1; $i -le 8; $i++) {
     }
 }
 
+# Append the required directory to PATH
+Write-Output "Appending D:\Alliance\Access\BSS\bin\win64 to PATH"
+$env:PATH += ";D:\Alliance\Access\BSS\bin\win64"
+
 # Execute the files and service management in the desired order
 try {
     # Step 1: Execute Initial Setup commands
     foreach ($file in $files[0..1]) {
         Write-Output "Executing $($file.Path)"
-        cmd.exe /c "$($file.Path)"
+        & "$($file.Path)"
 
         # Check the exit code
         if ($LASTEXITCODE -ne 0) {
@@ -47,12 +51,25 @@ try {
     # Step 3: Execute Command1 through Command8
     foreach ($file in $files[2..9]) {  # Commands 1 to 8
         Write-Output "Executing $($file.Path) with arguments $($file.Args)"
-        cmd.exe /c "$($file.Path) $($file.Args)"
 
-        # Check the exit code
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
-            throw "Execution aborted due to failure."
+        # Save the current location
+        $originalLocation = Get-Location
+
+        # Change to the directory containing the executable
+        Set-Location -Path (Split-Path -Path $file.Path)
+
+        try {
+            # Run the executable with arguments
+            & ".\$(Split-Path -Leaf $file.Path)" $file.Args.Split(' ')
+
+            # Check the exit code
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
+                throw "Execution aborted due to failure."
+            }
+        } finally {
+            # Restore the original location
+            Set-Location -Path $originalLocation
         }
     }
 
@@ -69,12 +86,25 @@ try {
     # Step 5: Execute Command9 through Command16
     foreach ($file in $files[10..17]) {  # Commands 9 to 16
         Write-Output "Executing $($file.Path) with arguments $($file.Args)"
-        cmd.exe /c "$($file.Path) $($file.Args)"
 
-        # Check the exit code
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
-            throw "Execution aborted due to failure."
+        # Save the current location
+        $originalLocation = Get-Location
+
+        # Change to the directory containing the executable
+        Set-Location -Path (Split-Path -Path $file.Path)
+
+        try {
+            # Run the executable with arguments
+            & ".\$(Split-Path -Leaf $file.Path)" $file.Args.Split(' ')
+
+            # Check the exit code
+            if ($LASTEXITCODE -ne 0) {
+                Write-Error "Error: $($file.Path) failed with exit code $LASTEXITCODE"
+                throw "Execution aborted due to failure."
+            }
+        } finally {
+            # Restore the original location
+            Set-Location -Path $originalLocation
         }
     }
 
