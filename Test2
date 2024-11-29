@@ -1,0 +1,87 @@
+# Append the required directory to PATH
+Write-Output "Appending D:\Alliance\Access\BSS\bin\win64 to PATH"
+$env:PATH += ";D:\Alliance\Access\BSS\bin\win64"
+
+# Create the batch script content
+$batchCommands = @"
+@echo off
+REM Append required directory to PATH
+set PATH=%PATH%;D:\Alliance\Access\BSS\bin\win64
+
+REM Execute Initial Setup commands
+call "C:\Path\To\SetupScript1.bat"
+if errorlevel 1 (
+    echo Error: SetupScript1.bat failed with exit code %errorlevel%
+    exit /b %errorlevel%
+)
+call "C:\Path\To\SetupScript2.bat"
+if errorlevel 1 (
+    echo Error: SetupScript2.bat failed with exit code %errorlevel%
+    exit /b %errorlevel%
+)
+
+REM Replace service stop with exe call
+echo Stopping service SERVICE_NAME
+"C:\Path\To\StopService.exe" "SERVICE_NAME"
+if errorlevel 1 (
+    echo Failed to stop service SERVICE_NAME
+    exit /b %errorlevel%
+)
+echo Service SERVICE_NAME stopped successfully.
+
+REM Execute Command1 through Command8
+for /L %%i in (1,1,8) do (
+    echo Executing messageTool.exe with arguments -r CRIOPER%%i -c
+    "D:\Alliance\Access\BSS\bin\win64\messageTool.exe" -r CRIOPER%%i -c
+    if errorlevel 1 (
+        echo Error: messageTool.exe failed with exit code %errorlevel%
+        exit /b %errorlevel%
+    )
+)
+
+REM Replace service start with exe call
+echo Starting service SERVICE_NAME
+"C:\Path\To\StartService.exe" "SERVICE_NAME"
+if errorlevel 1 (
+    echo Failed to start service SERVICE_NAME
+    exit /b %errorlevel%
+)
+echo Service SERVICE_NAME started successfully.
+
+REM Execute Command9 through Command16
+for /L %%i in (1,1,8) do (
+    echo Executing Executable2.exe with arguments ARG%%i
+    "C:\Path\To\Executable2.exe" ARG%%i
+    if errorlevel 1 (
+        echo Error: Executable2.exe failed with exit code %errorlevel%
+        exit /b %errorlevel%
+    )
+)
+
+echo Message Completion and Queue Release activity completed successfully.
+"@
+
+# Write the batch commands to a temporary batch file
+$tempBatchFile = "$env:TEMP\temp_script.bat"
+$batchCommands | Out-File -FilePath $tempBatchFile -Encoding ASCII
+
+try {
+    # Execute the batch file
+    Write-Output "Executing batch file $tempBatchFile"
+    & cmd.exe /c "$tempBatchFile"
+
+    # Check the exit code
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Batch script failed with exit code $LASTEXITCODE"
+        throw "Execution aborted due to failure."
+    }
+
+    Write-Output "All commands executed successfully."
+} catch {
+    # Log the exception and abort
+    Write-Error "Exception occurred: $_.Exception.Message"
+    throw $_
+} finally {
+    # Clean up: delete the temporary batch file
+    Remove-Item $tempBatchFile -Force
+}
