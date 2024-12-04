@@ -1,87 +1,189 @@
-# Append the required directory to PATH
-Write-Output "Appending D:\Alliance\Access\BSS\bin\win64 to PATH"
-$env:PATH += ";D:\Alliance\Access\BSS\bin\win64"
+# Determine the server name
+$serverName = $env:COMPUTERNAME
 
-# Create the batch script content
-$batchCommands = @"
-@echo off
-REM Append required directory to PATH
-set PATH=%PATH%;D:\Alliance\Access\BSS\bin\win64
+switch ($serverName) {
+    "ServerA" {
+        Write-Output "Running script on ServerA"
 
-REM Execute Initial Setup commands
-call "C:\Path\To\SetupScript1.bat"
-if errorlevel 1 (
-    echo Error: SetupScript1.bat failed with exit code %errorlevel%
-    exit /b %errorlevel%
-)
-call "C:\Path\To\SetupScript2.bat"
-if errorlevel 1 (
-    echo Error: SetupScript2.bat failed with exit code %errorlevel%
-    exit /b %errorlevel%
-)
+        try {
+            # Step 1: Run UA09 Environment Setup
+            $envSetupScript = "D:\Support\SAA_SERVICE\SSSAAEUAPUA09_ENV.bat"
+            Write-Output "Executing environment setup: $envSetupScript"
+            Start-Process -FilePath $envSetupScript -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Error: SSSAAEUAPUA09_ENV.bat failed with exit code $LASTEXITCODE"
+            }
 
-REM Replace service stop with exe call
-echo Stopping service SERVICE_NAME
-"C:\Path\To\StopService.exe" "SERVICE_NAME"
-if errorlevel 1 (
-    echo Failed to stop service SERVICE_NAME
-    exit /b %errorlevel%
-)
-echo Service SERVICE_NAME stopped successfully.
+            # Step 2: Update PATH
+            Write-Output "Appending directories to PATH"
+            $env:PATH += ";D:\Alliance\Access\BSS\bin\win64;D:\Alliance\Access\CRS\bin\win64"
 
-REM Execute Command1 through Command8
-for /L %%i in (1,1,8) do (
-    echo Executing messageTool.exe with arguments -r CRIOPER%%i -c
-    "D:\Alliance\Access\BSS\bin\win64\messageTool.exe" -r CRIOPER%%i -c
-    if errorlevel 1 (
-        echo Error: messageTool.exe failed with exit code %errorlevel%
-        exit /b %errorlevel%
-    )
-)
+            # Step 3: Stop SAA Service
+            $saaStopCommand = "D:\Path\To\saa_system stop"
+            Write-Output "Stopping SAA service"
+            Start-Process -FilePath $saaStopCommand -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to stop SAA service with exit code $LASTEXITCODE"
+            }
+            Write-Output "Service SAA stopped successfully."
 
-REM Replace service start with exe call
-echo Starting service SERVICE_NAME
-"C:\Path\To\StartService.exe" "SERVICE_NAME"
-if errorlevel 1 (
-    echo Failed to start service SERVICE_NAME
-    exit /b %errorlevel%
-)
-echo Service SERVICE_NAME started successfully.
+            # Step 4: Execute Message Completion (OPER1 through OPER8)
+            for ($i = 1; $i -le 8; $i++) {
+                $args = "-r", "CRIOPER$i", "-c"
+                Write-Output "Executing messageTool.exe with arguments: $args"
+                Start-Process -FilePath "D:\Alliance\Access\BSS\bin\win64\messageTool.exe" -ArgumentList $args -NoNewWindow -Wait
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Error: messageTool.exe failed with exit code $LASTEXITCODE"
+                }
+            }
 
-REM Execute Command9 through Command16
-for /L %%i in (1,1,8) do (
-    echo Executing Executable2.exe with arguments ARG%%i
-    "C:\Path\To\Executable2.exe" ARG%%i
-    if errorlevel 1 (
-        echo Error: Executable2.exe failed with exit code %errorlevel%
-        exit /b %errorlevel%
-    )
-)
+            # Step 5: Start SAA Service
+            $saaStartCommand = "D:\Path\To\saa_system start"
+            Write-Output "Starting SAA service"
+            Start-Process -FilePath $saaStartCommand -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to start SAA service with exit code $LASTEXITCODE"
+            }
+            Write-Output "SAA service started successfully."
 
-echo Message Completion and Queue Release activity completed successfully.
-"@
+            # Step 6: Execute Environment Variables Setup for CRNet (setcrsenv.bat)
+            $crsEnvSetupScript = "D:\Alliance\Access\CRS\bin\win64\setcrsenv.bat"
+            Write-Output "Executing CRNet environment setup: $crsEnvSetupScript"
+            Start-Process -FilePath $crsEnvSetupScript -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Error: setcrsenv.bat failed with exit code $LASTEXITCODE"
+            }
 
-# Write the batch commands to a temporary batch file
-$tempBatchFile = "$env:TEMP\temp_script.bat"
-$batchCommands | Out-File -FilePath $tempBatchFile -Encoding ASCII
+            # Step 7: Start CRNet Service
+            $crnetStartScript = "D:\Path\To\crs_control.bat start"
+            Write-Output "Starting CRNet service"
+            Start-Process -FilePath $crnetStartScript -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to start CRNet service with exit code $LASTEXITCODE"
+            }
+            Write-Output "CRNet Service started successfully."
 
-try {
-    # Execute the batch file
-    Write-Output "Executing batch file $tempBatchFile"
-    & cmd.exe /c "$tempBatchFile"
+            # Step 8: Execute Queue Release (OPER1 through OPER8)
+            for ($i = 1; $i -le 8; $i++) {
+                $args = "OPER$i"
+                Write-Output "Executing releaseq.exe with arguments: $args"
+                Start-Process -FilePath "D:\Path\To\releaseq.exe" -ArgumentList $args -NoNewWindow -Wait
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Error: releaseq.exe failed with exit code $LASTEXITCODE"
+                }
+            }
 
-    # Check the exit code
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Batch script failed with exit code $LASTEXITCODE"
-        throw "Execution aborted due to failure."
+            # Final Success Message
+            Write-Output "All operations completed successfully on ServerA."
+
+        } catch {
+            # Handle Errors
+            Write-Error "An error occurred on ServerA: $_.Exception.Message"
+            throw "Script execution aborted on ServerA due to failure."
+        }
     }
 
-    Write-Output "All commands executed successfully."
-} catch {
-    # Log the exception and abort
-    Write-Error "Exception occurred: $_.Exception.Message"
-    throw $_
-} finally {
-    # Clean up: delete the temporary batch file
-    Remove-Item $tempBatchFile -Force
+    "ServerB" {
+        Write-Output "Running script on ServerB"
+
+        try {
+            # Step 1: Run UA09 Environment Setup
+            $envSetupScript = "D:\Support\SAA_SERVICE\SSSAAEUAPUA09_ENV.bat"
+            Write-Output "Executing environment setup: $envSetupScript"
+            Start-Process -FilePath $envSetupScript -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Error: SSSAAEUAPUA09_ENV.bat failed with exit code $LASTEXITCODE"
+            }
+
+            # Step 2: Update PATH
+            Write-Output "Appending directories to PATH"
+            $env:PATH += ";D:\Alliance\Access\BSS\bin\win64;D:\Alliance\Access\CRS\bin\win64"
+
+            # Step 3: Stop SAA Service
+            $saaStopCommand = "D:\Path\To\saa_system stop"
+            Write-Output "Stopping SAA service"
+            Start-Process -FilePath $saaStopCommand -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to stop SAA service with exit code $LASTEXITCODE"
+            }
+            Write-Output "Service SAA stopped successfully."
+
+            # Step 4: Execute Message Completion (GILT1 through GILT3 and EQTY1 through EQTY3)
+            for ($i = 1; $i -le 3; $i++) {
+                $args = "-r", "GILT$i", "-c"
+                Write-Output "Executing messageTool.exe with arguments: $args"
+                Start-Process -FilePath "D:\Alliance\Access\BSS\bin\win64\messageTool.exe" -ArgumentList $args -NoNewWindow -Wait
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Error: messageTool.exe failed with exit code $LASTEXITCODE"
+                }
+            }
+
+            for ($i = 1; $i -le 3; $i++) {
+                $args = "-r", "EQTY$i", "-c"
+                Write-Output "Executing messageTool.exe with arguments: $args"
+                Start-Process -FilePath "D:\Alliance\Access\BSS\bin\win64\messageTool.exe" -ArgumentList $args -NoNewWindow -Wait
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Error: messageTool.exe failed with exit code $LASTEXITCODE"
+                }
+            }
+
+            # Step 5: Start SAA Service
+            $saaStartCommand = "D:\Path\To\saa_system start"
+            Write-Output "Starting SAA service"
+            Start-Process -FilePath $saaStartCommand -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to start SAA service with exit code $LASTEXITCODE"
+            }
+            Write-Output "SAA service started successfully."
+
+            # Step 6: Execute Environment Variables Setup for CRNet (setcrsenv.bat)
+            $crsEnvSetupScript = "D:\Alliance\Access\CRS\bin\win64\setcrsenv.bat"
+            Write-Output "Executing CRNet environment setup: $crsEnvSetupScript"
+            Start-Process -FilePath $crsEnvSetupScript -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Error: setcrsenv.bat failed with exit code $LASTEXITCODE"
+            }
+
+            # Step 7: Start CRNet Service
+            $crnetStartScript = "D:\Path\To\crs_control.bat start"
+            Write-Output "Starting CRNet service"
+            Start-Process -FilePath $crnetStartScript -NoNewWindow -Wait
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to start CRNet service with exit code $LASTEXITCODE"
+            }
+            Write-Output "CRNet Service started successfully."
+
+            # Step 8: Execute Queue Release (GILT1 through GILT3 and EQTY1 through EQTY3)
+            for ($i = 1; $i -le 3; $i++) {
+                $args = "GILT$i"
+                Write-Output "Executing releaseq.exe with arguments: $args"
+                Start-Process -FilePath "D:\Path\To\releaseq.exe" -ArgumentList $args -NoNewWindow -Wait
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Error: releaseq.exe failed with exit code $LASTEXITCODE"
+                }
+            }
+
+            for ($i = 1; $i -le 3; $i++) {
+                $args = "EQTY$i"
+                Write-Output "Executing releaseq.exe with arguments: $args"
+                Start-Process -FilePath "D:\Path\To\releaseq.exe" -ArgumentList $args -NoNewWindow -Wait
+                if ($LASTEXITCODE -ne 0) {
+                    throw "Error: releaseq.exe failed with exit code $LASTEXITCODE"
+                }
+            }
+
+            # Final Success Message
+            Write-Output "All operations completed successfully on ServerB."
+
+        } catch {
+            # Handle Errors
+            Write-Error "An error occurred on ServerB: $_.Exception.Message"
+            throw "Script execution aborted on ServerB due to failure."
+        }
+    }
+
+    Default {
+        Write-Output "Server not recognized. Execution aborted."
+        throw "Unrecognized server: $serverName"
+    }
 }
