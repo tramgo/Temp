@@ -7,11 +7,11 @@ CREATE TABLE #WaitTypeDescriptions (
 -- Insert common wait types and their descriptions
 INSERT INTO #WaitTypeDescriptions (wait_type, description)
 VALUES
-    -- [Add all the wait types as before]
+    -- [Include all wait types as before]
     ('LCK_M_S', 'Waiting to acquire a shared lock'),
     ('LCK_M_U', 'Waiting to acquire an update lock'),
     ('LCK_M_X', 'Waiting to acquire an exclusive lock'),
-    -- [Include all other wait types]
+    -- [Add other wait types]
     ('OTHER', 'Other wait types');
 
 WITH cte_blocking_sessions AS (
@@ -77,7 +77,7 @@ SELECT DISTINCT
     txt.text AS sql_text,
     cte.blocking_session_id,
     cte.execution_level,
-    cte.ordering, -- Included to fix ORDER BY error
+    cte.ordering,
     cte.wait_type,
     -- Include wait type description
     ISNULL(wtd.description, 'Unknown wait type') AS wait_type_description,
@@ -88,11 +88,11 @@ SELECT DISTINCT
     cte.wait_resource,
     -- Resource description based on wait_resource
     rd.resource_description,
-    -- Object details from sys.dm_tran_locks and sys.objects
-    DB_NAME(tl.resource_database_id) AS database_name,
-    s.name AS schema_name,
-    o.name AS object_name,
-    i.name AS index_name,
+    -- Object details
+    od.database_name,
+    od.schema_name,
+    od.object_name,
+    od.index_name,
     ses.login_name,
     ses.status,
     ses.host_name,
@@ -120,32 +120,74 @@ CROSS APPLY
     sys.dm_exec_sql_text(cte.sql_handle) AS txt
 LEFT JOIN
     #WaitTypeDescriptions wtd ON cte.wait_type = wtd.wait_type
--- Join with sys.dm_tran_locks to get object details
-LEFT JOIN (
-    SELECT DISTINCT
-        request_session_id,
-        resource_type AS lock_resource_type,
-        resource_database_id,
-        resource_associated_entity_id
-    FROM sys.dm_tran_locks
-) tl ON cte.session_id = tl.request_session_id
-LEFT JOIN
-    sys.objects o ON tl.resource_associated_entity_id = o.object_id
-LEFT JOIN
-    sys.schemas s ON o.schema_id = s.schema_id
-LEFT JOIN
-    sys.indexes i ON o.object_id = i.object_id AND tl.lock_resource_type IN ('KEY', 'INDEX')
--- Use a CROSS APPLY to parse wait_resource and extract additional info
+-- Use CROSS APPLY to parse wait_resource and extract IDs
 CROSS APPLY (
     SELECT 
         CASE 
-            WHEN cte.wait_resource LIKE 'KEY: %' THEN 'Waiting for a lock on an index key'
-            WHEN cte.wait_resource LIKE 'PAGE: %' THEN 'Waiting for a lock on a data or index page'
-            WHEN cte.wait_resource LIKE 'OBJECT: %' THEN 'Waiting for a lock on an entire object'
-            WHEN cte.wait_resource LIKE 'RID: %' THEN 'Waiting for a lock on a row in a heap'
-            ELSE 'Waiting for a resource'
-        END AS resource_description
+            WHEN cte.wait_resource LIKE 'KEY: %' THEN 'KEY'
+            WHEN cte.wait_resource LIKE 'PAGE: %' THEN 'PAGE'
+            WHEN cte.wait_resource LIKE 'RID: %' THEN 'RID'
+            WHEN cte.wait_resource LIKE 'OBJECT: %' THEN 'OBJECT'
+            ELSE NULL
+        END AS resource_type,
+        -- Extract identifiers based on resource type
+        CASE 
+            WHEN cte.wait_resource LIKE 'KEY: %' THEN
+                PARSENAME(REPLACE(SUBSTRING(cte.wait_resource, 6, CHARINDEX('(', cte.wait_resource) - 7), ':', '.'), 2)
+        END AS hobt_id,
+        CASE 
+            WHEN cte.wait_resource LIKE 'KEY: %' THEN
+                PARSENAME(REPLACE(SUBSTRING(cte.wait_resource, 6, CHARINDEX('(', cte.wait_resource) - 7), ':', '.'), 1)
+        WHEN cte.wait_resource LIKE 'PAGE: %' OR cte.wait_resource LIKE 'RID: %' OR cte.wait_resource LIKE 'OBJECT: %' THEN
+                PARSENAME(REPLACE(SUBSTRING(cte.wait_resource, CHARINDEX(':', cte.wait_resource) + 1, LEN(cte.wait_resource)), ':', '.'), 3)
+        END AS dbid,
+        CASE 
+            WHEN cte.wait_resource LIKE 'PAGE: %' OR cte.wait_resource LIKE 'RID: %' THEN
+                PARSENAME(REPLACE(cte.wait_resource, ':', '.'), 2)
+        END AS fileid,
+        CASE 
+            WHEN cte.wait_resource LIKE 'PAGE: %' OR cte.wait_resource LIKE 'RID: %' THEN
+                PARSENAME(REPLACE(cte.wait_resource, ':', '.'), 1)
+        END AS pageid,
+        CASE 
+            WHEN cte.wait_resource LIKE 'RID: %' THEN
+                PARSENAME(REPLACE(cte.wait_resource, ':', '.'), 0)
+        END AS slotid,
+        CASE 
+            WHEN cte.wait_resource LIKE 'OBJECT: %' THEN
+                PARSENAME(REPLACE(cte.wait_resource, ':', '.'), 1)
+        END AS objectid,
+        cte.wait_resource AS resource_description
 ) rd
+-- Get object details based on extracted IDs
+OUTER APPLY (
+    SELECT TOP 1
+        DB_NAME(CONVERT(int, rd.dbid)) AS database_name,
+        SCHEMA_NAME(o.schema_id) AS schema_name,
+        o.name AS object_name,
+        i.name AS index_name
+    FROM 
+        sys.objects o
+    LEFT JOIN 
+        sys.indexes i ON o.object_id = i.object_id
+    WHERE 
+        o.object_id = 
+            CASE 
+                WHEN rd.resource_type = 'KEY' THEN
+                    (SELECT object_id FROM sys.partitions WHERE hobt_id = CONVERT(bigint, rd.hobt_id))
+                WHEN rd.resource_type = 'OBJECT' THEN CONVERT(int, rd.objectid)
+                WHEN rd.resource_type = 'PAGE' OR rd.resource_type = 'RID' THEN
+                    (SELECT object_id FROM sys.allocation_units au
+                     INNER JOIN sys.partitions p ON au.container_id = p.hobt_id
+                     WHERE au.allocation_unit_id = 
+                        (SELECT allocation_unit_id FROM sys.fn_PhysLocCracker(
+                            CONVERT(binary(8), (
+                                SELECT CONVERT(binary(4), CONVERT(int, rd.fileid)) +
+                                       CONVERT(binary(4), CONVERT(int, rd.pageid))
+                            ))
+                        )))
+            END
+) od
 ORDER BY 
     cte.ordering, cte.execution_level;
 
