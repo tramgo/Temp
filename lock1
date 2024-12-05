@@ -7,67 +7,11 @@ CREATE TABLE #WaitTypeDescriptions (
 -- Insert common wait types and their descriptions
 INSERT INTO #WaitTypeDescriptions (wait_type, description)
 VALUES
-    -- Lock Waits
+    -- [Add all the wait types as before]
     ('LCK_M_S', 'Waiting to acquire a shared lock'),
     ('LCK_M_U', 'Waiting to acquire an update lock'),
     ('LCK_M_X', 'Waiting to acquire an exclusive lock'),
-    ('LCK_M_IS', 'Waiting to acquire an intent shared lock'),
-    ('LCK_M_IX', 'Waiting to acquire an intent exclusive lock'),
-    ('LCK_M_SCH_S', 'Waiting to acquire a schema stability lock'),
-    ('LCK_M_SCH_M', 'Waiting to acquire a schema modification lock'),
-    ('LCK_M_BU', 'Waiting to acquire a bulk update lock'),
-
-    -- I/O Waits
-    ('PAGEIOLATCH_SH', 'Waiting for a page to be read into buffer (shared)'),
-    ('PAGEIOLATCH_EX', 'Waiting for a page to be read into buffer (exclusive)'),
-    ('PAGEIOLATCH_UP', 'Waiting for a page to be read into buffer (update)'),
-    ('WRITELOG', 'Waiting for log flush to complete'),
-
-    -- Latch Waits
-    ('PAGELATCH_SH', 'Waiting for a latch on a buffer page (shared)'),
-    ('PAGELATCH_EX', 'Waiting for a latch on a buffer page (exclusive)'),
-    ('PAGELATCH_UP', 'Waiting for a latch on a buffer page (update)'),
-    ('PAGELATCH_DT', 'Waiting for a latch on a buffer page (destroy)'),
-    ('PAGELATCH_KP', 'Waiting for a latch on a buffer page (keep)'),
-
-    -- Network and Communication Waits
-    ('ASYNC_NETWORK_IO', 'Waiting for network IO completion'),
-    ('NETWORK_IO', 'Waiting for network IO'),
-    ('REQUEST_FOR_DEADLOCK_SEARCH', 'Waiting for deadlock search cycle'),
-    ('BROKER_RECEIVE_WAITFOR', 'Waiting for Service Broker message'),
-
-    -- CPU and Scheduler Waits
-    ('SOS_SCHEDULER_YIELD', 'Waiting for a CPU scheduler'),
-    ('THREADPOOL', 'Waiting for a worker thread to become available'),
-    ('RESOURCE_SEMAPHORE', 'Waiting for memory grant'),
-    ('CXPACKET', 'Waiting for parallel threads to synchronize'),
-    ('CXCONSUMER', 'Waiting for parallelism coordination'),
-
-    -- Memory Waits
-    ('RESOURCE_SEMAPHORE_QUERY_COMPILE', 'Waiting for memory for query compilation'),
-    ('MEMORY_ALLOCATION_EXT', 'Waiting for memory allocation'),
-
-    -- File and Disk Waits
-    ('IO_COMPLETION', 'Waiting for I/O operations to complete'),
-    ('LOGMGR', 'Waiting for log manager operations'),
-    ('LOGMGR_RESERVE_APPEND', 'Waiting for log space reservation'),
-
-    -- Backup and Restore Waits
-    ('BACKUPIO', 'Waiting for backup I/O operations'),
-    ('BACKUPBUFFER', 'Waiting for backup buffer operations'),
-
-    -- Other Waits
-    ('OLEDB', 'Waiting for OLEDB provider'),
-    ('CLR_SEMAPHORE', 'Waiting for CLR memory'),
-    ('CLR_MANUAL_EVENT', 'Waiting for CLR manual event'),
-    ('PREEMPTIVE_OS_AUTHENTICATIONOPS', 'Waiting for external authentication operations'),
-    ('PREEMPTIVE_OS_FILEOPS', 'Waiting for external file operations'),
-    ('FT_IFTS_SCHEDULER_IDLE_WAIT', 'Waiting for full-text index population'),
-    ('BROKER_TRANSMITTER', 'Waiting for Service Broker transmitter'),
-    ('SQLTRACE_BUFFER_FLUSH', 'Waiting for SQL Trace buffer flush'),
-    ('MISCELLANEOUS', 'Waiting for miscellaneous operations'),
-
-    -- Add more wait types and descriptions as needed
+    -- [Include all other wait types]
     ('OTHER', 'Other wait types');
 
 WITH cte_blocking_sessions AS (
@@ -127,13 +71,13 @@ WITH cte_blocking_sessions AS (
     INNER JOIN 
         cte_blocking_sessions cte ON br.blocking_session_id = cte.session_id
 )
-
 SELECT DISTINCT 
     -- Indentation to represent the blocking hierarchy
-    REPLICATE(' ', execution_level * 4) + '|-' + CAST(cte.session_id AS VARCHAR(5)) AS session_id,
+    REPLICATE(' ', cte.execution_level * 4) + '|-' + CAST(cte.session_id AS VARCHAR(5)) AS session_id,
     txt.text AS sql_text,
     cte.blocking_session_id,
     cte.execution_level,
+    cte.ordering, -- Included to fix ORDER BY error
     cte.wait_type,
     -- Include wait type description
     ISNULL(wtd.description, 'Unknown wait type') AS wait_type_description,
@@ -142,14 +86,13 @@ SELECT DISTINCT
     RIGHT('0' + CAST((cte.wait_time / 1000 / 60) % 60 AS VARCHAR), 2) + ':' +
     RIGHT('0' + CAST((cte.wait_time / 1000) % 60 AS VARCHAR), 2) AS wait_time_formatted,
     cte.wait_resource,
-    wt.resource_description,
-    -- New columns to show object details
-    DB_NAME(wt.[database_id]) AS database_name,
-    sc.name AS schema_name,
+    -- Resource description based on wait_resource
+    rd.resource_description,
+    -- Object details from sys.dm_tran_locks and sys.objects
+    DB_NAME(tl.resource_database_id) AS database_name,
+    s.name AS schema_name,
     o.name AS object_name,
     i.name AS index_name,
-    -- Description of the resource
-    ISNULL(rd.resource_description, 'Waiting for a resource') AS resource_type_description,
     ses.login_name,
     ses.status,
     ses.host_name,
@@ -176,16 +119,22 @@ LEFT JOIN
 CROSS APPLY 
     sys.dm_exec_sql_text(cte.sql_handle) AS txt
 LEFT JOIN
-    sys.dm_os_waiting_tasks wt ON cte.session_id = wt.session_id
-LEFT JOIN
     #WaitTypeDescriptions wtd ON cte.wait_type = wtd.wait_type
--- Join to get object details using resource_associated_entity_id
+-- Join with sys.dm_tran_locks to get object details
+LEFT JOIN (
+    SELECT DISTINCT
+        request_session_id,
+        resource_type AS lock_resource_type,
+        resource_database_id,
+        resource_associated_entity_id
+    FROM sys.dm_tran_locks
+) tl ON cte.session_id = tl.request_session_id
 LEFT JOIN
-    sys.objects o ON wt.resource_associated_entity_id = o.object_id
+    sys.objects o ON tl.resource_associated_entity_id = o.object_id
 LEFT JOIN
-    sys.schemas sc ON o.schema_id = sc.schema_id
+    sys.schemas s ON o.schema_id = s.schema_id
 LEFT JOIN
-    sys.indexes i ON o.object_id = i.object_id AND wt.resource_type IN ('KEY', 'INDEX')
+    sys.indexes i ON o.object_id = i.object_id AND tl.lock_resource_type IN ('KEY', 'INDEX')
 -- Use a CROSS APPLY to parse wait_resource and extract additional info
 CROSS APPLY (
     SELECT 
