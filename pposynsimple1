@@ -1,0 +1,597 @@
+# -------------------------------------------
+# 1. Install Necessary Packages
+# -------------------------------------------
+# Uncomment and run the following line if you haven't installed the required packages yet.
+!pip install stable-baselines3 gymnasium ta matplotlib seaborn torch scikit-learn pandas
+
+# -------------------------------------------
+# 2. Import Libraries
+# -------------------------------------------
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import pandas as pd
+from ta import trend, momentum, volatility
+import matplotlib.pyplot as plt
+import seaborn as sns
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.vec_env import DummyVecEnv
+import torch
+import warnings
+from typing import Optional
+import random
+import datetime
+import os
+import logging
+
+# -------------------------------------------
+# 3. Configure Logging
+# -------------------------------------------
+# Ensure the 'results' directory exists before setting up logging
+os.makedirs('results', exist_ok=True)
+
+# Set up logging to capture detailed information about the agent's actions and environment
+logging.basicConfig(
+    filename='results/agent_log.log',
+    filemode='w',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# -------------------------------------------
+# 4. Suppress Warnings for Cleaner Output
+# -------------------------------------------
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# -------------------------------------------
+# 5. Set Random Seeds for Reproducibility
+# -------------------------------------------
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+# -------------------------------------------
+# 6. Create Directories to Save Plots and Results
+# -------------------------------------------
+os.makedirs('plots', exist_ok=True)
+os.makedirs('results', exist_ok=True)
+
+# -------------------------------------------
+# 7. Define Data Generation Function (Synthetic)
+# -------------------------------------------
+def get_data(ticker: str, start_date: str, end_date: str, num_days: int = 2000) -> pd.DataFrame:
+    """
+    Generates synthetic stock data and calculates technical indicators.
+    We simulate a price series using a random walk model.
+    """
+    # Generate a date range
+    dates = pd.date_range(start_date, periods=num_days, freq='B')  # Business days
+    
+    # Synthetic parameters
+    initial_price = 100.0
+    volatility = 0.02  # daily volatility
+    drift = 0.0005  # slight daily upward drift
+
+    # Generate price series using a random walk
+    # log returns
+    returns = np.random.normal(drift, volatility, num_days)
+    price = initial_price * np.exp(np.cumsum(returns))
+    
+    # Construct Open, High, Low, Close
+    # For simplicity: 
+    #   Open = Close of previous day (except first)
+    #   High = Close + random factor
+    #   Low = Close - random factor
+    #   Close = generated from random walk
+    #   Volume = random integer
+    opens = np.roll(price, 1)
+    opens[0] = price[0] * (1 - 0.005)  # first open slightly less than first close
+    highs = price + np.random.uniform(0.1, 1.0, size=num_days)
+    lows = price - np.random.uniform(0.1, 1.0, size=num_days)
+    volume = np.random.randint(1000, 10000, size=num_days)
+
+    df = pd.DataFrame({
+        'Date': dates,
+        'Open': opens,
+        'High': highs,
+        'Low': lows,
+        'Close': price,
+        'Volume': volume
+    })
+
+    # Calculate technical indicators using the 'Close' column
+    df['SMA10'] = trend.SMAIndicator(close=df['Close'], window=10).sma_indicator()
+    df['SMA50'] = trend.SMAIndicator(close=df['Close'], window=50).sma_indicator()
+    df['RSI'] = momentum.RSIIndicator(close=df['Close'], window=14).rsi()
+    df['MACD'] = trend.MACD(close=df['Close']).macd()
+    bollinger = volatility.BollingerBands(close=df['Close'], window=20, window_dev=2)
+    df['BB_Upper'] = bollinger.bollinger_hband()
+    df['BB_Lower'] = bollinger.bollinger_lband()
+    df['Volatility'] = df['Close'].rolling(window=14).std()
+
+    # Additional indicators
+    df['Momentum'] = momentum.AwesomeOscillatorIndicator(high=df['High'], low=df['Low']).awesome_oscillator()
+    df['Stochastic'] = momentum.StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close']).stoch()
+    df['CCI'] = trend.CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14).cci()
+    df['ADX'] = trend.ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14).adx()
+
+    # Set VIX to zero as we are not fetching it
+    df['VIX'] = 0
+
+    # Handle any remaining NaN values using forward fill
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(0, inplace=True)  # Fill any remaining NaNs with zero
+
+    # Ensure 'Date' is a datetime object without timezone
+    df['Date'] = pd.to_datetime(df['Date']).tz_localize(None)
+
+    # Normalize technical indicators (exclude 'Close', 'Open', 'High', 'Low', 'Volume')
+    from sklearn.preprocessing import MinMaxScaler
+    features = ['SMA10', 'SMA50', 'RSI', 'MACD', 'BB_Upper', 'BB_Lower',
+                'Volatility', 'Momentum', 'Stochastic', 'CCI', 'ADX', 'VIX']
+    scaler = MinMaxScaler()
+    df[features] = scaler.fit_transform(df[features])
+
+    # Check for NaNs and Infs
+    df[features].fillna(0, inplace=True)
+    df[features].replace([np.inf, -np.inf], 0, inplace=True)
+
+    return df
+
+# -------------------------------------------
+# 8. Define Custom Gymnasium Environment
+# -------------------------------------------
+class StockTradingEnv(gym.Env):
+    metadata = {'render.modes': ['human']}
+
+    def __init__(self, df: pd.DataFrame, initial_balance: float = 10000, max_steps: Optional[int] = None):
+        super(StockTradingEnv, self).__init__()
+
+        self.df = df.copy().reset_index(drop=True)
+        self.initial_balance = initial_balance
+        self.current_step = 0
+        self.max_steps = max_steps if max_steps else len(self.df) - 1
+
+        # Define action space: Continuous action [-1, 1]
+        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
+
+        # Define observation space
+        # Features + balance ratio + shares ratio + net worth ratio
+        # Number of features: len(df.columns) - 1 ('Date') + 3
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(self.df.columns)-1+3,), dtype=np.float32)
+
+        # Initialize state variables
+        self.reset()
+
+    def _next_observation(self) -> np.ndarray:
+        price = abs(self.df.loc[self.current_step, 'Close'])
+        if price == 0:
+            price = 1e-8  # Prevent division by zero
+
+        obs = np.array(
+            list(self.df.loc[self.current_step].drop('Date')) + [
+                self.balance / self.initial_balance,
+                self.shares_held / (self.initial_balance / price),
+                self.net_worth / self.initial_balance,
+            ], dtype=np.float32)
+
+        # Check for NaN and Inf values
+        if np.isnan(obs).any() or np.isinf(obs).any():
+            print(f"Invalid values in observation at step {self.current_step}")
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return obs
+
+    def step(self, action: np.ndarray):
+        action = np.clip(action[0], -1, 1)  # Ensure action is within [-1, 1]
+        current_price = abs(self.df.loc[self.current_step, 'Close'])
+        volatility = self.df.loc[self.current_step, 'Volatility']
+        TRANSACTION_COST = 0.001  # 0.1% transaction cost
+
+        # Prevent division by zero
+        if current_price <= 0:
+            current_price = 1e-8
+        if volatility <= 0:
+            volatility = 1e-8
+
+        # Adjust position size based on action and volatility
+        max_shares = int(self.balance / current_price)
+        if max_shares <= 0:
+            max_shares = 0
+
+        # Cap inverse volatility to prevent huge positions
+        inverse_volatility = min(1 / volatility, 10)
+        if abs(action) > 0.05:  # Lowered threshold to allow more trades
+            position_size = int(max_shares * abs(action) * inverse_volatility)
+            position_size = max(position_size, 1)  # Ensure at least one share is traded
+        else:
+            position_size = 0  # Treat as 'Hold'
+
+        # Execute trade
+        if action > 0 and position_size > 0:
+            # Buy shares
+            shares_to_buy = min(position_size, max_shares)
+            total_cost = shares_to_buy * current_price * (1 + TRANSACTION_COST)
+            if shares_to_buy > 0 and self.balance >= total_cost:
+                self.balance -= total_cost
+                self.shares_held += shares_to_buy
+                action_str = 'Buy'
+            else:
+                action_str = 'Hold'
+        elif action < 0 and position_size > 0:
+            # Sell shares
+            shares_to_sell = min(position_size, self.shares_held)
+            total_revenue = shares_to_sell * current_price * (1 - TRANSACTION_COST)
+            if shares_to_sell > 0:
+                self.balance += total_revenue
+                self.shares_held -= shares_to_sell
+                action_str = 'Sell'
+            else:
+                action_str = 'Hold'
+        else:
+            action_str = 'Hold'
+
+        # Update net worth
+        self.prev_net_worth = self.net_worth
+        self.net_worth = self.balance + self.shares_held * current_price
+
+        # Calculate reward as the change in net worth
+        reward = self.net_worth - self.prev_net_worth
+
+        # Handle NaN or Inf in reward
+        if np.isnan(reward) or np.isinf(reward):
+            print(f"Invalid reward at step {self.current_step}, setting reward to 0.")
+            reward = 0.0
+
+        # Prevent negative balance and net worth
+        if self.balance < 0:
+            print(f"Negative balance at step {self.current_step}, setting balance to 0.")
+            self.balance = 0.0
+
+        if self.net_worth < 0:
+            print(f"Negative net worth at step {self.current_step}, setting net worth to 0.")
+            self.net_worth = 0.0
+
+        # Append to history
+        self.history.append({
+            'Step': self.current_step,
+            'Date': self.df.loc[self.current_step, 'Date'],
+            'Price': current_price,
+            'Action': action_str,
+            'Balance': self.balance,
+            'Shares Held': self.shares_held,
+            'Net Worth': self.net_worth,
+            'Reward': reward
+        })
+
+        # Increment step
+        self.current_step += 1
+        done = self.current_step >= self.max_steps
+
+        # Get next observation if not done
+        if not done:
+            obs = self._next_observation()
+        else:
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+
+        # Termination condition
+        terminated = done
+        truncated = False
+
+        # Log the action and reward
+        logging.info(f"{self.df.loc[self.current_step-1, 'Date']} - Action: {action_str}, Reward: {reward:.2f}")
+
+        return obs, reward, terminated, truncated, {}
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+        self.balance = self.initial_balance
+        self.net_worth = self.initial_balance
+        self.prev_net_worth = self.initial_balance
+        self.shares_held = 0
+        self.total_shares_sold = 0
+        self.total_sales_value = 0
+        self.current_step = 0
+        self.history = []
+        return self._next_observation(), {}
+
+    def render(self, mode='human', close=False):
+        profit = self.net_worth - self.initial_balance
+        print(f'Step: {self.current_step}')
+        print(f'Date: {self.df.loc[self.current_step, "Date"]}')
+        print(f'Balance: ${self.balance:.2f}')
+        print(f'Shares Held: {self.shares_held}')
+        print(f'Net Worth: ${self.net_worth:.2f}')
+        print(f'Profit: ${profit:.2f}')
+
+# -------------------------------------------
+# 9. Implement Baseline Strategies
+# -------------------------------------------
+def buy_and_hold(df: pd.DataFrame, initial_balance: float = 10000) -> dict:
+    """
+    Implements a Buy and Hold strategy.
+    """
+    # Invest the entire initial balance
+    investment_percentage = 1.0  # 100% investment
+    investment_amount = initial_balance * investment_percentage
+
+    buy_price = df.iloc[0]['Close']
+    holdings = investment_amount // buy_price
+    invested_capital = holdings * buy_price
+    balance = initial_balance - invested_capital  # Remaining balance
+    net_worth = balance + holdings * df.iloc[-1]['Close']
+    profit = net_worth - initial_balance
+
+    # Record positions over time
+    holdings_over_time = [holdings] * len(df)
+    net_worth_over_time = [balance + holdings * price for price in df['Close']]
+    positions = pd.DataFrame({
+        'Date': df['Date'],
+        'Holdings': holdings_over_time,
+        'Balance': [balance] * len(df),
+        'Net Worth': net_worth_over_time
+    })
+
+    return {
+        'Strategy': 'Buy and Hold',
+        'Initial Balance': initial_balance,
+        'Final Net Worth': net_worth,
+        'Profit': profit,
+        'Invested Capital': invested_capital,
+        'Final Holdings': holdings,
+        'Final Balance': balance,
+        'Positions': positions
+    }
+
+# -------------------------------------------
+# 10. Define Training Function
+# -------------------------------------------
+def train_rl_agent(env: gym.Env, total_timesteps: int = 200000) -> PPO:
+    """
+    Trains a PPO agent on the provided environment.
+    """
+    # Wrap the environment in a DummyVecEnv
+    env = DummyVecEnv([lambda: env])
+
+    # Define the policy network architecture
+    policy_kwargs = dict(
+        activation_fn=torch.nn.ReLU,
+        net_arch=[dict(pi=[128, 128], vf=[128, 128])]
+    )
+
+    model = PPO(
+        'MlpPolicy',
+        env,
+        verbose=1,
+        seed=RANDOM_SEED,
+        policy_kwargs=policy_kwargs,
+        learning_rate=3e-4
+    )
+
+    model.learn(total_timesteps=total_timesteps)
+    return model
+
+# -------------------------------------------
+# 11. Define RL Agent Execution Function
+# -------------------------------------------
+def run_rl_agent(env: gym.Env, model: PPO) -> list:
+    """
+    Runs the trained RL agent in the environment.
+    """
+    obs, _ = env.reset()
+    rl_history = []
+
+    while True:
+        action, _states = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+        if hasattr(env, 'history') and len(env.history) > 0:
+            rl_history.append(env.history[-1])  # Store the latest step
+        if terminated or truncated:
+            break
+
+    return rl_history
+
+# -------------------------------------------
+# 12. Define Visualization and Saving Function
+# -------------------------------------------
+def visualize_and_save_results(df: pd.DataFrame, rl_history: list, strategies: list, ticker: str):
+    """
+    Creates visualizations for the RL agent's actions, compares strategies,
+    and saves results to CSV files.
+    """
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    # Convert rl_history to DataFrame
+    rl_df = pd.DataFrame(rl_history)
+
+    if rl_df.empty:
+        print(f"No RL history available for {ticker}. Skipping visualization.")
+        return
+
+    # Ensure 'Date' is in datetime format
+    rl_df['Date'] = pd.to_datetime(rl_df['Date'])
+
+    # Check action counts
+    print(f"{ticker} RL Agent Action Counts:")
+    print(rl_df['Action'].value_counts())
+
+    # a. Overlay Buy and Sell Actions on the Stock Price Chart
+    plt.figure(figsize=(14, 7))
+    plt.plot(df['Date'], df['Close'], label='Close Price', alpha=0.5)
+
+    # Plot buy signals
+    buy_signals = rl_df[rl_df['Action'] == 'Buy']
+    plt.scatter(buy_signals['Date'], buy_signals['Price'], marker='^', color='green', label='Buy', alpha=1)
+
+    # Plot sell signals
+    sell_signals = rl_df[rl_df['Action'] == 'Sell']
+    plt.scatter(sell_signals['Date'], sell_signals['Price'], marker='v', color='red', label='Sell', alpha=1)
+
+    plt.title(f'{ticker} Stock Price with Buy and Sell Signals (RL Agent)')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'plots/{ticker}_actions.png')
+    plt.close()
+    print(f"Saved buy/sell actions plot to 'plots/{ticker}_actions.png'.")
+
+    # Save RL history to CSV
+    rl_df.to_csv(f'results/{ticker}_RL_history.csv', index=False)
+    print(f"Saved RL history to 'results/{ticker}_RL_history.csv'.")
+
+    # b. Visualize positions over time and save to CSV
+    visualize_positions_and_save(strategies, ticker)
+
+def visualize_positions_and_save(strategies: list, ticker: str):
+    """
+    Visualizes the net worth over time for different strategies and saves the results.
+    """
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plt.figure(figsize=(14, 7))
+    for result in strategies:
+        positions = result.get('Positions')
+        if positions is not None and not positions.empty:
+            plt.plot(positions['Date'], positions['Net Worth'], label=result['Strategy'])
+            # Save each strategy's positions to CSV
+            strategy_name_clean = result['Strategy'].replace(" ", "_")
+            positions.to_csv(f'results/{ticker}_{strategy_name_clean}_positions.csv', index=False)
+            print(f"Saved {result['Strategy']} positions to 'results/{ticker}_{strategy_name_clean}_positions.csv'.")
+
+    plt.xlabel('Date')
+    plt.ylabel('Net Worth')
+    plt.title(f'{ticker} Net Worth Over Time')
+    plt.legend()
+    plt.savefig(f'plots/{ticker}_net_worth.png')
+    plt.close()
+    print(f"Saved net worth plot to 'plots/{ticker}_net_worth.png'.")
+
+    # Print detailed results
+    print(f"\n{ticker} Strategy Performance:")
+    for result in strategies:
+        print(f"{result['Strategy']}:")
+        print(f"  Initial Balance: ${result['Initial Balance']}")
+        print(f"  Final Net Worth: ${result['Final Net Worth']:.2f}")
+        print(f"  Profit: ${result['Profit']:.2f}")
+        print(f"  Final Holdings: {result.get('Final Holdings', 'N/A')}")
+        print(f"  Final Balance: ${result.get('Final Balance', 'N/A')}\n")
+
+    # c. Plotting the final profits
+    profit_data = {
+        strategy['Strategy']: strategy['Profit']
+        for strategy in strategies
+    }
+
+    plt.figure(figsize=(12,6))
+    sns.barplot(x=list(profit_data.keys()), y=list(profit_data.values()), palette="viridis")
+    plt.title(f'{ticker} Final Profit Comparison of Strategies')
+    plt.xlabel('Strategy')
+    plt.ylabel('Profit ($)')
+    plt.xticks(rotation=45)
+    plt.savefig(f'plots/{ticker}_profit_comparison.png')
+    plt.close()
+    print(f"Saved profit comparison plot to 'plots/{ticker}_profit_comparison.png'.")
+
+    # Save profit comparison to CSV
+    profit_df = pd.DataFrame(list(profit_data.items()), columns=['Strategy', 'Profit'])
+    profit_df.to_csv(f'results/{ticker}_profit_comparison.csv', index=False)
+    print(f"Saved profit comparison to 'results/{ticker}_profit_comparison.csv'.")
+
+# -------------------------------------------
+# 13. Main Execution Block
+# -------------------------------------------
+def main():
+    # Parameters
+    TICKER = 'SYNTHETIC_STOCK'
+    START_DATE = '2005-01-01'
+    END_DATE = datetime.datetime.today().strftime('%Y-%m-%d')
+    INITIAL_BALANCE = 10000
+    TOTAL_TIMESTEPS = 200000  # Increased for better training
+    MIN_TEST_DAYS = 100  # Minimum number of days required in test set
+    NUM_DAYS = 2000  # Total number of synthetic data points
+    
+    print("Suggestion: For faster training, consider using a machine with a GPU.\n"
+          "Google Colab offers free GPU resources that can speed up the training process.")
+
+    print(f"\nProcessing ticker: {TICKER}")
+
+    # Generate synthetic data
+    df = get_data(TICKER, START_DATE, END_DATE, num_days=NUM_DAYS)
+
+    # Split data into training and testing sets
+    # We'll use last ~500 days for testing
+    split_index = len(df) - 500
+    train_df = df.iloc[:split_index].reset_index(drop=True)
+    test_df = df.iloc[split_index:].reset_index(drop=True)
+
+    # Check if test_df has sufficient data
+    if len(test_df) < MIN_TEST_DAYS:
+        print(f"Test data for {TICKER} is too small ({len(test_df)} days). Exiting.")
+        return
+
+    # 2. Initialize environment
+    train_env = StockTradingEnv(train_df, initial_balance=INITIAL_BALANCE)
+
+    # 3. Check environment compatibility
+    check_env(train_env, warn=True)
+
+    # 4. Train RL Agent
+    print(f"Training RL Agent for {TICKER}...")
+    rl_model = train_rl_agent(train_env, total_timesteps=TOTAL_TIMESTEPS)
+    logging.info(f"Training completed for {TICKER}.")
+
+    # 5. Run RL Agent on Test Data
+    test_env = StockTradingEnv(test_df, initial_balance=INITIAL_BALANCE)
+    rl_history = run_rl_agent(test_env, rl_model)
+    logging.info(f"Testing completed for {TICKER}.")
+
+    # 6. Run Baseline Strategies on Test Data
+    bh_result = buy_and_hold(test_df, initial_balance=INITIAL_BALANCE)
+    logging.info(f"Baseline strategy (Buy and Hold) completed for {TICKER}.")
+
+    # Prepare RL Agent's results for comparison
+    rl_df = pd.DataFrame(rl_history)
+    if not rl_df.empty:
+        rl_positions = pd.DataFrame({
+            'Date': rl_df['Date'],
+            'Holdings': rl_df['Shares Held'],
+            'Balance': rl_df['Balance'],
+            'Net Worth': rl_df['Net Worth']
+        })
+        rl_result = {
+            'Strategy': 'RL Agent',
+            'Initial Balance': INITIAL_BALANCE,
+            'Final Net Worth': rl_df.iloc[-1]['Net Worth'] if not rl_df.empty else 0,
+            'Profit': rl_df.iloc[-1]['Net Worth'] - INITIAL_BALANCE if not rl_df.empty else 0,
+            'Final Holdings': rl_df.iloc[-1]['Shares Held'] if not rl_df.empty else 0,
+            'Final Balance': rl_df.iloc[-1]['Balance'] if not rl_df.empty else 0,
+            'Positions': rl_positions
+        }
+    else:
+        rl_result = {
+            'Strategy': 'RL Agent',
+            'Initial Balance': INITIAL_BALANCE,
+            'Final Net Worth': 0,
+            'Profit': 0,
+            'Final Holdings': 0,
+            'Final Balance': 0,
+            'Positions': pd.DataFrame()
+        }
+
+    # 7. Compile and Visualize Results
+    strategies = [bh_result, rl_result]  # Add other strategies to this list
+    visualize_and_save_results(test_df, rl_history, strategies, TICKER)
+    logging.info(f"Visualization and saving completed for {TICKER}.")
+
+# -------------------------------------------
+# 14. Run the Main Function
+# -------------------------------------------
+if __name__ == "__main__":
+    main()
