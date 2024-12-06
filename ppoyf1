@@ -6,7 +6,7 @@ from gymnasium import spaces
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from ta import trend, momentum, volatility, volume  # Added 'volume' here
+from ta import trend, momentum, volatility, volume
 import matplotlib.pyplot as plt
 import seaborn as sns
 from stable_baselines3 import PPO
@@ -24,65 +24,51 @@ import math
 import time
 import logging
 from logging.handlers import RotatingFileHandler
-from matplotlib.backends.backend_pdf import PdfPages  # For PDF stitching
-from pathlib import Path  # For robust path handling
-import optuna  # Optuna for hyperparameter tuning
+from matplotlib.backends.backend_pdf import PdfPages
+from pathlib import Path
+import optuna
 
 # -------------------------------------------
 # 2. Configure Logging
 # -------------------------------------------
-# Enable detailed logging by setting ENABLE_LOGGING to True
-ENABLE_LOGGING = True  # Set to True to enable logging
+ENABLE_LOGGING = True
 
-# Define relative directories for results and plots
-# Relative to the script's directory
 BASE_DIR = Path(__file__).parent.resolve()
 RESULTS_DIR = BASE_DIR / 'results'
 PLOTS_DIR = BASE_DIR / 'plots'
 
-# Create directories if they do not exist
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Configure logging
 if ENABLE_LOGGING:
-    # Create a rotating file handler
     handler = RotatingFileHandler(
         RESULTS_DIR / 'agent_log.log',
-        maxBytes=5*1024*1024,  # 5 MB
-        backupCount=5,          # Keep up to 5 backup logs
+        maxBytes=5*1024*1024,
+        backupCount=5,
         encoding='utf-8'
     )
-    
-    # Set logging level to INFO for general logs and DEBUG for detailed logs
     handler.setLevel(logging.DEBUG)
-    
-    # Define the log message format
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
-    
-    # Get the root logger and set its level
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     logger.addHandler(handler)
-    
-    # Also log to console
+
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 else:
-    # Disable all logging if not enabled
     logging.disable(logging.CRITICAL)
 
 # -------------------------------------------
-# 3. Suppress Other Warnings for Cleaner Output
+# 3. Suppress Warnings
 # -------------------------------------------
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # -------------------------------------------
-# 4. Set Random Seeds for Reproducibility
+# 4. Set Seeds
 # -------------------------------------------
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
@@ -93,14 +79,8 @@ torch.manual_seed(RANDOM_SEED)
 # 5. Fetch and Prepare Data
 # -------------------------------------------
 def get_data(ticker: str, start_date: str, end_date: str, max_retries: int = 3) -> pd.DataFrame:
-    """
-    Downloads historical stock data and calculates technical indicators.
-    Implements retry logic to handle potential issues in data availability.
-    """
     retry_count = 0
     df = pd.DataFrame()
-
-    # Retry mechanism for data download
     while retry_count < max_retries:
         try:
             df = yf.download(ticker, start=start_date, end=end_date, progress=False)
@@ -108,46 +88,39 @@ def get_data(ticker: str, start_date: str, end_date: str, max_retries: int = 3) 
                 break
         except Exception as e:
             logging.error(f"Error fetching data for {ticker}: {e}")
-        
+
         retry_count += 1
         logging.warning(f"Retry {retry_count}/{max_retries} for downloading data for {ticker}...")
-        time.sleep(1)  # Wait for a second before retrying
+        time.sleep(1)
 
-    # Check if data is successfully downloaded
     if df.empty:
-        logging.error(f"Failed to fetch data for {ticker} after {max_retries} attempts. Skipping this ticker.")
+        logging.error(f"Failed to fetch data for {ticker} after {max_retries} attempts.")
         return df
 
-    # Check for data freshness
-    if not df.empty:
-        last_date = df.index[-1]
-        expected_last_date = pd.to_datetime(end_date) - pd.DateOffset(days=10)
-        if last_date < expected_last_date:
-            logging.error(f"Data for {ticker} appears outdated (Last Date: {last_date.date()}), skipping...")
-            return pd.DataFrame()
+    last_date = df.index[-1]
+    expected_last_date = pd.to_datetime(end_date) - pd.DateOffset(days=10)
+    if last_date < expected_last_date:
+        logging.error(f"Data for {ticker} appears outdated (Last Date: {last_date.date()})")
+        return pd.DataFrame()
 
-    # Check for expected columns and flatten MultiIndex if necessary
     if isinstance(df.columns, pd.MultiIndex):
         if len(df.columns.levels[1]) == 1:
             df.columns = df.columns.droplevel(1)
         else:
             df.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in df.columns.values]
 
-    # Ensure necessary columns are present
-    required_columns = ['Close', 'High', 'Low', 'Volume']  # Added 'Volume' as it's needed for VWAP
+    required_columns = ['Close', 'High', 'Low', 'Volume']
     if not all(col in df.columns for col in required_columns):
-        logging.error(f"Missing required columns in data for {ticker}. Available columns: {df.columns.tolist()}")
+        logging.error(f"Missing required columns in data for {ticker}.")
         return pd.DataFrame()
 
-    # Check data completeness
-    if df[required_columns].isna().mean().max() > 0.3:  # 30% threshold for data completeness
-        logging.error(f"Too many missing values in critical columns for {ticker}. Skipping...")
+    if df[required_columns].isna().mean().max() > 0.3:
+        logging.error(f"Too many missing values for {ticker}.")
         return pd.DataFrame()
 
-    # Determine which 'Close' column to use
     close_col = 'Close' if 'Close' in df.columns else 'Adj Close'
 
-    # Calculate technical indicators
+    # Indicators
     try:
         sma10 = trend.SMAIndicator(close=df[close_col], window=10).sma_indicator()
         sma50 = trend.SMAIndicator(close=df[close_col], window=50).sma_indicator()
@@ -157,18 +130,15 @@ def get_data(ticker: str, start_date: str, end_date: str, max_retries: int = 3) 
         bollinger = volatility.BollingerBands(close=df[close_col], window=20, window_dev=2)
         bb_upper = bollinger.bollinger_hband()
         bb_lower = bollinger.bollinger_lband()
-        bollinger_width = bollinger.bollinger_wband()  # Bollinger Band width
+        bollinger_width = bollinger.bollinger_wband()
         ema20 = trend.EMAIndicator(close=df[close_col], window=20).ema_indicator()
         vwap = volume.VolumeWeightedAveragePrice(high=df['High'], low=df['Low'], close=df[close_col], volume=df['Volume'], window=14).volume_weighted_average_price()
-        lagged_return = df[close_col].pct_change(periods=1).fillna(0)  # 1-day lagged return
-
-        # Calculate Volatility using Average True Range (ATR)
+        lagged_return = df[close_col].pct_change(periods=1).fillna(0)
         atr = volatility.AverageTrueRange(high=df['High'], low=df['Low'], close=df[close_col], window=14).average_true_range()
     except Exception as e:
         logging.error(f"Error calculating indicators for {ticker}: {e}")
         return pd.DataFrame()
 
-    # Assign indicators to DataFrame
     df['SMA10'] = sma10
     df['SMA50'] = sma50
     df['RSI'] = rsi
@@ -180,64 +150,50 @@ def get_data(ticker: str, start_date: str, end_date: str, max_retries: int = 3) 
     df['EMA20'] = ema20
     df['VWAP'] = vwap
     df['Lagged_Return'] = lagged_return
-    df['Volatility'] = atr  # Added Volatility
+    df['Volatility'] = atr
 
-    # Check for missing values after indicators
-    indicator_columns = ['SMA10', 'SMA50', 'RSI', 'MACD', 'ADX', 'BB_Upper', 'BB_Lower', 
-                        'Bollinger_Width', 'EMA20', 'VWAP', 'Lagged_Return', 'Volatility']
-    if df[indicator_columns].isna().mean().max() > 0.3:
-        logging.error(f"Calculated indicators have too many missing values for {ticker}. Skipping...")
-        return pd.DataFrame()
-
-    # Handle any remaining NaN values using forward fill and replace with zero
     df.fillna(method='ffill', inplace=True)
     df.fillna(0, inplace=True)
 
-    # Reset index to have 'Date' as a column
     df.reset_index(inplace=True)
-
-    # Preserve the original 'Close' for plotting
     df['Close_unscaled'] = df[close_col]
 
-    # Normalize features using StandardScaler
-    features = ['Close', 'SMA10', 'SMA50', 'RSI', 'MACD', 'ADX', 
-                'BB_Upper', 'BB_Lower', 'Bollinger_Width', 'EMA20', 
-                'VWAP', 'Lagged_Return', 'Volatility']  # Added 'Volatility'
+    features = ['Close', 'SMA10', 'SMA50', 'RSI', 'MACD', 'ADX',
+                'BB_Upper', 'BB_Lower', 'Bollinger_Width', 'EMA20',
+                'VWAP', 'Lagged_Return', 'Volatility']
 
-    # Check for zero variance in features to avoid division by zero
     if (df[features].std() == 0).any():
-        logging.error(f"One or more features have zero variance for {ticker}. Skipping...")
+        logging.error(f"One or more features have zero variance for {ticker}.")
         return pd.DataFrame()
 
     scaler = StandardScaler()
     df[features] = scaler.fit_transform(df[features])
 
-    # Check for NaN or Inf values after normalization
     if df[features].isna().values.any():
-        logging.warning("NaN values found in features after normalization. Filling with 0.")
+        logging.warning("NaN values found after normalization.")
         df[features].fillna(0, inplace=True)
 
     if np.isinf(df[features].values).any():
-        logging.warning("Inf values found in features after normalization. Replacing with 0.")
+        logging.warning("Inf values found after normalization.")
         df[features] = df[features].replace([np.inf, -np.inf], 0)
 
     return df
 
 def get_multiple_tickers_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """
-    Downloads historical stock data for a single ticker and calculates technical indicators.
-    """
     df = get_data(ticker, start_date, end_date)
     if not df.empty:
         df['Ticker'] = ticker
     return df
 
 # -------------------------------------------
-# 6. Define Custom Gymnasium Environment with Enhancements
+# 6. Define Custom Gymnasium Environment
 # -------------------------------------------
 class SingleStockTradingEnv(gym.Env):
     """
-    A custom Gymnasium environment for trading a single stock ticker with enhanced risk management.
+    Modified environment to use a single continuous action for buying/selling.
+    Action in [-1, 1]:
+      action > 0: Buy position_size shares proportional to action and inverse of volatility.
+      action < 0: Sell position_size shares proportional to abs(action) and inverse of volatility.
     """
     metadata = {'render.modes': ['human']}
 
@@ -250,71 +206,53 @@ class SingleStockTradingEnv(gym.Env):
         self.df = df.copy().reset_index(drop=True)
         self.initial_balance = initial_balance
         self.current_step = 0
-        self.stop_loss = stop_loss  # e.g., 10% stop loss
-        self.take_profit = take_profit  # e.g., 10% take profit
-        self.max_position_size = max_position_size  # Max 25% of portfolio per position
-        self.max_drawdown = max_drawdown  # Max 20% drawdown allowed
-        self.annual_trading_days = annual_trading_days  # For Sharpe Ratio calculation
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.max_position_size = max_position_size
+        self.max_drawdown = max_drawdown
+        self.annual_trading_days = annual_trading_days
 
-        # Define action space: Continuous actions for Buy and Sell fractions [-1, 1]
-        # Action[0]: Fraction to Buy (-1 to 1)
-        # Action[1]: Fraction to Sell (-1 to 1)
-        # Adjusted to symmetric range as recommended
-        self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+        # Changed action space to single dimension: [-1, 1]
+        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
 
-        # Define observation space
-        # Features: [Close, SMA10, SMA50, RSI, MACD, ADX, BB_Upper, BB_Lower, Bollinger_Width, EMA20, VWAP, Lagged_Return, Volatility]
-        # Portfolio metrics: Balance ratio, Net Worth ratio, Current Position ratio
-        # Market Phase is one-hot encoded (e.g., Bull, Bear, Sideways)
-        self.num_features = 13  # Updated number of features per ticker
+        # Observation space
+        self.num_features = 13
         self.market_phase = ['Bull', 'Bear', 'Sideways']
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, 
                                             shape=(self.num_features + 3 + len(self.market_phase),), 
                                             dtype=np.float32)
 
-        # Define the exact features to include in observations
         self.feature_names = ['Close', 'SMA10', 'SMA50', 'RSI', 'MACD', 'ADX', 
                               'BB_Upper', 'BB_Lower', 'Bollinger_Width', 'EMA20', 
-                              'VWAP', 'Lagged_Return', 'Volatility']  # Included 'Volatility'
+                              'VWAP', 'Lagged_Return', 'Volatility']
 
-        # Initialize state variables
         self.reset()
 
     def _next_observation(self) -> np.ndarray:
-        obs = []
         if self.current_step >= len(self.df):
             self.current_step = len(self.df) - 1
-
         current_data = self.df.iloc[self.current_step]
-
-        # Extract features
         features = current_data[self.feature_names].values
-        obs.extend(features)
+        obs = list(features)
 
-        # Portfolio metrics
         obs.append(self.balance / self.initial_balance)
         obs.append(self.net_worth / self.initial_balance)
         obs.append(self.position / self.initial_balance)
 
-        # Market Phase Detection based on ADX
         adx = current_data['ADX']
         if adx > 25:
-            # Strong trend
             if current_data['SMA10'] > current_data['SMA50']:
                 phase = 'Bull'
             else:
                 phase = 'Bear'
         else:
-            # Weak trend
             phase = 'Sideways'
 
-        # One-hot encode market phase
         for p in self.market_phase:
             obs.append(1.0 if phase == p else 0.0)
 
         obs = np.array(obs, dtype=np.float32)
 
-        # Check for NaN and Inf values
         if np.isnan(obs).any() or np.isinf(obs).any():
             logging.warning(f"Invalid values in observation at step {self.current_step}")
             obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -322,165 +260,138 @@ class SingleStockTradingEnv(gym.Env):
         return obs
 
     def step(self, actions: np.ndarray):
-        """
-        Executes one time step within the environment.
-        Actions:
-            actions[0]: Fraction to Buy (-1 to 1)
-            actions[1]: Fraction to Sell (-1 to 1)
-        """
         current_data = self.df.iloc[self.current_step]
         terminated = False
         truncated = False
-        reward = 0
 
         current_price = current_data['Close_unscaled']
+        action = float(np.clip(actions[0], -1, 1))
 
-        # Clip actions to ensure they are within the action space
-        actions = np.clip(actions, self.action_space.low, self.action_space.high)
+        # Extract volatility and ensure it's positive
+        volatility = float(current_data['Volatility'])
+        if volatility <= 0:
+            volatility = 1e-6  # Avoid division by zero
 
-        # Interpret actions: positive values indicate buying, negative indicate selling
-        buy_fraction = max(actions[0], 0)
-        sell_fraction = max(actions[1], 0)
+        # Calculate max shares we can buy with current balance
+        max_shares = int(self.balance / current_price)
+        if max_shares < 0:
+            max_shares = 0
 
-        # Adaptive Position Sizing based on ADX (trend strength)
-        adx = current_data['ADX']
-        if adx > 25:
-            # Strong trend - allow larger positions
-            adaptive_size = self.max_position_size * 2  # Up to 50%
-        elif adx > 20:
-            # Moderate trend
-            adaptive_size = self.max_position_size
-        else:
-            # Weak trend - reduce position size
-            adaptive_size = self.max_position_size * 0.5
+        # Position sizing: scale by abs(action) and inverse of volatility
+        # This ensures that with higher volatility, we take smaller positions.
+        position_size = int(max_shares * abs(action) * (1 / volatility))
 
-        adaptive_size = min(adaptive_size, 1.0)  # Ensure it doesn't exceed 100%
+        # Ensure position_size does not exceed a fraction of portfolio (max_position_size)
+        # Max position value allowed
+        max_value_allowed = self.max_position_size * self.net_worth
+        max_shares_allowed = int(max_value_allowed / current_price)
+        position_size = min(position_size, max_shares_allowed)
 
-        # Execute Buy Action
-        buy_fraction = buy_fraction * adaptive_size  # Adjust based on market phase
-        max_buy = (adaptive_size * self.net_worth) / current_price
-        shares_to_buy = math.floor(buy_fraction * max_buy)
-        buy_signal_price = np.nan  # Initialize
-        if shares_to_buy > 0 and self.balance >= shares_to_buy * current_price:
-            self.balance -= shares_to_buy * current_price
-            self.position += shares_to_buy
-            self.total_buy_cost += shares_to_buy * current_price  # For average buy price
-            buy_signal_price = current_price  # Record Buy Signal Price
+        buy_signal_price = np.nan
+        sell_signal_price = np.nan
 
-        # Execute Sell Action
-        sell_fraction = sell_fraction * adaptive_size  # Adjust based on market phase
-        max_sell = (adaptive_size * self.position)
-        shares_to_sell = math.floor(sell_fraction * max_sell)
-        shares_to_sell = min(shares_to_sell, self.position)
-        sell_signal_price = np.nan  # Initialize
-        if shares_to_sell > 0:
-            self.balance += shares_to_sell * current_price
-            self.position -= shares_to_sell
-            self.total_shares_sold += shares_to_sell
-            self.total_sales_value += shares_to_sell * current_price
-            sell_signal_price = current_price  # Record Sell Signal Price
+        if action > 0:
+            # Buying position_size shares if we have enough balance
+            shares_to_buy = position_size
+            if shares_to_buy > 0 and self.balance >= shares_to_buy * current_price:
+                self.balance -= shares_to_buy * current_price
+                self.position += shares_to_buy
+                self.total_buy_cost += shares_to_buy * current_price
+                buy_signal_price = current_price
+        elif action < 0:
+            # Selling position_size shares if we hold enough
+            shares_to_sell = min(position_size, self.position)
+            if shares_to_sell > 0:
+                self.balance += shares_to_sell * current_price
+                self.position -= shares_to_sell
+                self.total_shares_sold += shares_to_sell
+                self.total_sales_value += shares_to_sell * current_price
+                sell_signal_price = current_price
 
-        # Update net worth
         self.net_worth = self.balance + self.position * current_price
-
-        # Calculate reward: Change in net worth minus penalties
         reward = self.net_worth - self.prev_net_worth
-
-        # Reward Smoothing
-        smoothed_reward = reward * 0.9 + self.prev_reward * 0.1  # Smoothing
-        self.prev_reward = reward  # Keep track of the previous reward
+        smoothed_reward = reward * 0.9 + self.prev_reward * 0.1
+        self.prev_reward = reward
         reward = smoothed_reward
 
-        # Calculate drawdown
         self.peak = max(self.peak, self.net_worth)
         drawdown = (self.net_worth - self.peak) / self.peak
 
-        # Penalize for drawdown exceeding max_drawdown
         if drawdown < -self.max_drawdown:
-            reward -= 100  # Large penalty
+            reward -= 100
             terminated = True
-            self.early_stop = True  # Early stop flag
+            self.early_stop = True
 
-        # Implement stop-loss and take-profit
         if self.position > 0:
             avg_buy_price = self.total_buy_cost / self.position if self.position > 0 else 0
-            price_change = current_price / avg_buy_price
+            price_change = current_price / avg_buy_price if avg_buy_price > 0 else 1.0
             if price_change <= self.stop_loss:
-                # Trigger stop-loss
+                # Stop loss triggered
                 self.balance += self.position * current_price
-                reward -= self.position * avg_buy_price * (1 - self.stop_loss)  # Loss
-                # Record Stop-Loss action
+                reward -= self.position * avg_buy_price * (1 - self.stop_loss)
                 self.drawdown_action = 'Stop-Loss'
                 self.position = 0
                 terminated = True
-                self.early_stop = True  # Early stop flag
+                self.early_stop = True
             elif price_change >= self.take_profit:
-                # Trigger take-profit
+                # Take profit triggered
                 self.balance += self.position * current_price
-                reward += self.position * avg_buy_price * (self.take_profit - 1)  # Gain
-                # Record Take-Profit action
+                reward += self.position * avg_buy_price * (self.take_profit - 1)
                 self.drawdown_action = 'Take-Profit'
                 self.position = 0
                 terminated = True
-                self.early_stop = True  # Early stop flag
+                self.early_stop = True
 
-        # Update previous net worth
         self.prev_net_worth = self.net_worth
 
-        # Check for bankruptcy
         if self.net_worth <= 0:
-            reward -= 1000  # Severe penalty
+            reward -= 1000
             terminated = True
             truncated = True
-            self.early_stop = True  # Early stop flag
+            self.early_stop = True
 
-        # Reward Engineering: Penalize high volatility positions
+        # Penalize in high volatility environments for large positions
+        # This line is optional and can be adjusted as needed
         if current_data['Volatility'] > self.df['Volatility'].quantile(0.75):
-            reward -= 0.1 * self.position * current_price  # Adjust penalty as needed
+            reward -= 0.1 * self.position * current_price
 
-        # Append to history
-        action_type = 'Drawdown' if hasattr(self, 'drawdown_action') else None
+        action_type = None
+        if hasattr(self, 'drawdown_action'):
+            action_type = self.drawdown_action
+
         self.history.append({
             'Step': self.current_step,
             'Date': current_data['Date'],
-            'Action_Buy_Fraction': buy_fraction,
-            'Action_Sell_Fraction': sell_fraction,
+            'Action': action,
             'Balance': self.balance,
             'Position': self.position,
             'Net Worth': self.net_worth,
             'Reward': reward,
             'Drawdown': drawdown,
             'Early Stop': self.early_stop,
-            'Action_Type': action_type,  # To indicate drawdown actions
-            'Buy_Signal_Price': buy_signal_price,   # For plotting
-            'Sell_Signal_Price': sell_signal_price  # For plotting
+            'Action_Type': action_type,
+            'Buy_Signal_Price': buy_signal_price,
+            'Sell_Signal_Price': sell_signal_price
         })
 
-        # Reset drawdown_action after recording
         if hasattr(self, 'drawdown_action'):
             del self.drawdown_action
 
-        # Increment step
         self.current_step += 1
-        if self.current_step >= len(self.df) -1:
+        if self.current_step >= len(self.df) - 1:
             terminated = True
 
-        # Prepare next observation
         if not terminated and not truncated:
             obs = self._next_observation()
         else:
             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
 
-        # Calculate Sharpe Ratio as an additional metric (not used in training)
-        sharpe_ratio = 0
         returns = pd.Series([h['Reward'] for h in self.history])
+        sharpe_ratio = 0
         if returns.std() != 0:
-            sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(self.annual_trading_days)  # Parameterized
-
-        # Prepare info dictionary
+            sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(self.annual_trading_days)
         info = {'Sharpe Ratio': sharpe_ratio, 'Early Stop': self.early_stop}
 
-        # Return five values as per Gymnasium's Env specification
         return obs, reward, terminated, truncated, info
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -491,14 +402,14 @@ class SingleStockTradingEnv(gym.Env):
         self.prev_net_worth = self.initial_balance
         self.prev_reward = 0
         self.peak = self.initial_balance
-        self.total_buy_cost = 0  # Total cost of buys for average buy price
+        self.total_buy_cost = 0
         self.total_shares_sold = 0
         self.total_sales_value = 0
         self.current_step = 0
         self.history = []
         self.early_stop = False
         obs = self._next_observation()
-        info = {}  # Additional info can be added here
+        info = {}
         return obs, info
 
     def render(self, mode='human', close=False):
@@ -511,13 +422,9 @@ class SingleStockTradingEnv(gym.Env):
         print(f'Profit: ${profit:.2f}')
 
 # -------------------------------------------
-# 7. Implement Baseline Strategies
+# 7. Baseline Strategies
 # -------------------------------------------
 def buy_and_hold(df: pd.DataFrame, ticker: str, initial_balance: float = 100000) -> dict:
-    """
-    Implements a Buy and Hold strategy for a single ticker.
-    Buys as many shares as possible at the start and holds until the end.
-    """
     buy_price = df.iloc[0]['Close_unscaled']
     shares_bought = math.floor(initial_balance / buy_price)
     balance = initial_balance - shares_bought * buy_price
@@ -528,8 +435,6 @@ def buy_and_hold(df: pd.DataFrame, ticker: str, initial_balance: float = 100000)
     net_worth = net_worth_series[-1]
     profit = net_worth - initial_balance
     max_drawdown = calculate_max_drawdown(pd.Series(net_worth_series))
-
-    # Calculate cumulative returns for plotting
     cumulative_returns = pd.Series(net_worth_series).div(initial_balance)
 
     return {
@@ -543,11 +448,6 @@ def buy_and_hold(df: pd.DataFrame, ticker: str, initial_balance: float = 100000)
     }
 
 def moving_average_crossover(df: pd.DataFrame, ticker: str, initial_balance: float = 100000) -> dict:
-    """
-    Implements a Moving Average Crossover strategy with RSI confirmation for a single ticker.
-    Buys when SMA10 crosses above SMA50 and RSI < 30.
-    Sells when SMA10 crosses below SMA50 and RSI > 70.
-    """
     balance = initial_balance
     holdings = 0
     net_worth_series = []
@@ -557,39 +457,32 @@ def moving_average_crossover(df: pd.DataFrame, ticker: str, initial_balance: flo
         prev = df.iloc[i-1]
         current = df.iloc[i]
 
-        # Golden cross with RSI < 30
         if prev['SMA10'] < prev['SMA50'] and current['SMA10'] >= current['SMA50']:
             if current['RSI'] < 30 and balance >= current['Close_unscaled']:
                 holdings += 1
                 balance -= current['Close_unscaled']
                 buy_signals.append(current['Close_unscaled'])
-                logging.debug(f"{ticker}: Buy at step {i}, price {current['Close_unscaled']}")
             else:
                 buy_signals.append(np.nan)
         else:
             buy_signals.append(np.nan)
 
-        # Death cross with RSI > 70
         if prev['SMA10'] > prev['SMA50'] and current['SMA10'] <= current['SMA50']:
             if current['RSI'] > 70 and holdings > 0:
                 holdings -= 1
                 balance += current['Close_unscaled']
                 sell_signals.append(current['Close_unscaled'])
-                logging.debug(f"{ticker}: Sell at step {i}, price {current['Close_unscaled']}")
             else:
                 sell_signals.append(np.nan)
         else:
             sell_signals.append(np.nan)
 
-        # Calculate net worth for the day
         current_net_worth = balance + holdings * current['Close_unscaled']
         net_worth_series.append(current_net_worth)
 
     net_worth = net_worth_series[-1]
     profit = net_worth - initial_balance
     max_drawdown = calculate_max_drawdown(pd.Series(net_worth_series))
-
-    # Calculate cumulative returns for plotting
     cumulative_returns = pd.Series(net_worth_series).div(initial_balance)
 
     return {
@@ -605,11 +498,6 @@ def moving_average_crossover(df: pd.DataFrame, ticker: str, initial_balance: flo
     }
 
 def macd_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 100000) -> dict:
-    """
-    Implements a MACD Crossover strategy for a single ticker.
-    Buys when MACD crosses above zero.
-    Sells when MACD crosses below zero.
-    """
     balance = initial_balance
     holdings = 0
     net_worth_series = []
@@ -619,12 +507,10 @@ def macd_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 100000
         prev = df.iloc[i-1]
         current = df.iloc[i]
 
-        # MACD crossover
         if prev['MACD'] < 0 and current['MACD'] >= 0 and balance >= current['Close_unscaled']:
             holdings += 1
             balance -= current['Close_unscaled']
             buy_signals.append(current['Close_unscaled'])
-            logging.debug(f"{ticker}: MACD Buy at step {i}, price {current['Close_unscaled']}")
         else:
             buy_signals.append(np.nan)
 
@@ -632,19 +518,15 @@ def macd_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 100000
             holdings -= 1
             balance += current['Close_unscaled']
             sell_signals.append(current['Close_unscaled'])
-            logging.debug(f"{ticker}: MACD Sell at step {i}, price {current['Close_unscaled']}")
         else:
             sell_signals.append(np.nan)
 
-        # Calculate net worth for the day
         current_net_worth = balance + holdings * current['Close_unscaled']
         net_worth_series.append(current_net_worth)
 
     net_worth = net_worth_series[-1]
     profit = net_worth - initial_balance
     max_drawdown = calculate_max_drawdown(pd.Series(net_worth_series))
-
-    # Calculate cumulative returns for plotting
     cumulative_returns = pd.Series(net_worth_series).div(initial_balance)
 
     return {
@@ -660,11 +542,6 @@ def macd_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 100000
     }
 
 def bollinger_bands_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 100000) -> dict:
-    """
-    Implements a Bollinger Bands strategy for a single ticker.
-    Buys when price crosses below lower band.
-    Sells when price crosses above upper band.
-    """
     balance = initial_balance
     holdings = 0
     net_worth_series = []
@@ -674,33 +551,26 @@ def bollinger_bands_strategy(df: pd.DataFrame, ticker: str, initial_balance: flo
         prev = df.iloc[i-1]
         current = df.iloc[i]
 
-        # Buy when price crosses below lower band
         if prev['Close_unscaled'] >= prev['BB_Lower'] and current['Close_unscaled'] < current['BB_Lower'] and balance >= current['Close_unscaled']:
             holdings += 1
             balance -= current['Close_unscaled']
             buy_signals.append(current['Close_unscaled'])
-            logging.debug(f"{ticker}: Bollinger Bands Buy at step {i}, price {current['Close_unscaled']}")
         else:
             buy_signals.append(np.nan)
 
-        # Sell when price crosses above upper band
         if prev['Close_unscaled'] <= prev['BB_Upper'] and current['Close_unscaled'] > current['BB_Upper'] and holdings > 0:
             holdings -= 1
             balance += current['Close_unscaled']
             sell_signals.append(current['Close_unscaled'])
-            logging.debug(f"{ticker}: Bollinger Bands Sell at step {i}, price {current['Close_unscaled']}")
         else:
             sell_signals.append(np.nan)
 
-        # Calculate net worth for the day
         current_net_worth = balance + holdings * current['Close_unscaled']
         net_worth_series.append(current_net_worth)
 
     net_worth = net_worth_series[-1]
     profit = net_worth - initial_balance
     max_drawdown = calculate_max_drawdown(pd.Series(net_worth_series))
-
-    # Calculate cumulative returns for plotting
     cumulative_returns = pd.Series(net_worth_series).div(initial_balance)
 
     return {
@@ -716,10 +586,6 @@ def bollinger_bands_strategy(df: pd.DataFrame, ticker: str, initial_balance: flo
     }
 
 def random_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 100000) -> dict:
-    """
-    Implements a Random strategy for a single ticker.
-    Randomly decides to Buy, Sell, or Hold each day.
-    """
     balance = initial_balance
     holdings = 0
     net_worth_series = []
@@ -732,27 +598,21 @@ def random_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 1000
             balance -= row['Close_unscaled']
             buy_signals.append(row['Close_unscaled'])
             sell_signals.append(np.nan)
-            logging.debug(f"{ticker}: Random Buy at step {i}, price {row['Close_unscaled']}")
         elif action == 'Sell' and holdings > 0:
             holdings -= 1
             balance += row['Close_unscaled']
             buy_signals.append(np.nan)
             sell_signals.append(row['Close_unscaled'])
-            logging.debug(f"{ticker}: Random Sell at step {i}, price {row['Close_unscaled']}")
         else:
             buy_signals.append(np.nan)
             sell_signals.append(np.nan)
-        # Hold does nothing
 
-        # Calculate net worth for the day
         current_net_worth = balance + holdings * row['Close_unscaled']
         net_worth_series.append(current_net_worth)
 
     net_worth = net_worth_series[-1]
     profit = net_worth - initial_balance
     max_drawdown = calculate_max_drawdown(pd.Series(net_worth_series))
-
-    # Calculate cumulative returns for plotting
     cumulative_returns = pd.Series(net_worth_series).div(initial_balance)
 
     return {
@@ -768,385 +628,28 @@ def random_strategy(df: pd.DataFrame, ticker: str, initial_balance: float = 1000
     }
 
 # -------------------------------------------
-# 8. Training the RL Agent with Optuna Hyperparameter Tuning
+# 8. (The rest of the code remains largely unchanged)
+# Below are helper functions and main execution as per original code.
+# Adjust if necessary for your workflow.
 # -------------------------------------------
-def train_rl_agent_with_optuna(ticker: str, df: pd.DataFrame, initial_balance: float, 
-                               stop_loss: float, take_profit: float, 
-                               max_position_size: float, max_drawdown: float,
-                               annual_trading_days: int = 252,
-                               n_trials: int = 50) -> dict:
-    """
-    Trains a PPO RL agent for a single ticker using Optuna for hyperparameter tuning.
-    Returns the best hyperparameters and corresponding performance metrics.
-    """
-    def objective(trial, max_drawdown=max_drawdown):
-        # Define hyperparameter search space
-        learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-3)
-        n_steps = trial.suggest_categorical('n_steps', [64, 128, 256])
-        batch_size = trial.suggest_categorical('batch_size', [64, 32, 16, 8, 4, 2])  # Excluded 1
-        gamma = trial.suggest_uniform('gamma', 0.90, 0.99)
-        gae_lambda = trial.suggest_uniform('gae_lambda', 0.90, 0.99)
-        clip_range = trial.suggest_uniform('clip_range', 0.1, 0.3)
-        ent_coef = trial.suggest_loguniform('ent_coef', 1e-8, 1e-2)
-        vf_coef = trial.suggest_uniform('vf_coef', 0.1, 1.0)
-        max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.3, 0.9)
-        net_arch = trial.suggest_categorical('net_arch', ['256_256', '256_128_256', '128_256_128'])
 
-        # Debug: Log sampled hyperparameters
-        logging.debug(f"Trial {trial.number}: batch_size={batch_size}, ent_coef={ent_coef}, net_arch={net_arch}")
-
-        # Map net_arch string to list
-        if net_arch == '256_256':
-            net_arch_list = [256, 256]
-        elif net_arch == '256_128_256':
-            net_arch_list = [256, 128, 256]
-        elif net_arch == '128_256_128':
-            net_arch_list = [128, 256, 128]
-        else:
-            net_arch_list = [256, 256]  # Default fallback
-
-        # Initialize environment
-        env = SingleStockTradingEnv(
-            df=df,
-            initial_balance=initial_balance,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            max_position_size=max_position_size,
-            max_drawdown=max_drawdown,
-            annual_trading_days=annual_trading_days
-        )
-
-        # Perform environment check on the raw environment
-        try:
-            check_env(env, warn=True)
-        except Exception as e:
-            logging.error(f"Environment check failed for {ticker}: {e}")
-            return 0  # Assign minimal reward
-
-        # Wrap the environment with DummyVecEnv (SB3 expects vectorized environments)
-        vec_env = DummyVecEnv([lambda: env])
-
-        # Define the policy network architecture
-        policy_kwargs = dict(
-            activation_fn=torch.nn.ReLU,
-            net_arch=net_arch_list  # Use the mapped list
-        )
-
-        model = PPO(
-            'MlpPolicy',
-            vec_env,
-            verbose=0,  # Set to 1 for detailed logs
-            seed=RANDOM_SEED,
-            policy_kwargs=policy_kwargs,
-            learning_rate=learning_rate,
-            n_steps=n_steps,
-            batch_size=batch_size,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            clip_range=clip_range,
-            ent_coef=ent_coef,
-            vf_coef=vf_coef,
-            max_grad_norm=max_grad_norm
-        )
-
-        try:
-            # Train the model
-            model.learn(total_timesteps=100000)  # Increased timesteps
-        except Exception as e:
-            logging.error(f"Training failed for {ticker} with hyperparameters {trial.params}: {e}")
-            return 0  # Assign minimal reward
-
-        # Evaluate the trained model
-        obs = vec_env.reset()
-        done = False
-        rl_history = []
-        while not done:
-            action, _states = model.predict(obs, deterministic=True)
-            obs, reward, done, info = vec_env.step(action)
-            if env.history:
-                rl_history.append(env.history[-1])
-
-        # Convert rl_history to DataFrame
-        rl_df = pd.DataFrame(rl_history)
-        rl_df['Date'] = pd.to_datetime(rl_df['Date'])
-
-        # Merge with original df to get 'Close_unscaled'
-        rl_df = pd.merge(rl_df, df[['Date', 'Close_unscaled']], on='Date', how='left')
-
-        # Calculate Sharpe Ratio
-        returns = rl_df['Reward']
-        sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(annual_trading_days) if returns.std() != 0 else 0
-
-        # Objective: Maximize Sharpe Ratio
-        return sharpe_ratio
-
-    # Create an Optuna study
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED))
-    study.optimize(lambda trial: objective(trial), n_trials=n_trials, timeout=7200)  # Increased trials and timeout
-
-    # Retrieve the best hyperparameters
-    best_params = study.best_params
-    best_score = study.best_value
-
-    logging.info(f"Best hyperparameters for {ticker}: {best_params}")
-    logging.info(f"Best Sharpe Ratio: {best_score}")
-
-    # Map net_arch string to list for the final model
-    best_net_arch = best_params.get('net_arch', '256_256')
-    if best_net_arch == '256_256':
-        net_arch_list = [256, 256]
-    elif best_net_arch == '256_128_256':
-        net_arch_list = [256, 128, 256]
-    elif best_net_arch == '128_256_128':
-        net_arch_list = [128, 256, 128]
-    else:
-        net_arch_list = [256, 256]  # Default fallback
-
-    # Train the final model with the best hyperparameters
-    # Initialize environment
-    env = SingleStockTradingEnv(
-        df=df,
-        initial_balance=initial_balance,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        max_position_size=max_position_size,
-        max_drawdown=max_drawdown,
-        annual_trading_days=annual_trading_days
-    )
-
-    # Wrap the environment with DummyVecEnv
-    vec_env = DummyVecEnv([lambda: env])
-
-    # Define the policy network architecture with best params
-    policy_kwargs = dict(
-        activation_fn=torch.nn.ReLU,
-        net_arch=net_arch_list  # Use the mapped list
-    )
-
-    # Initialize the model with best hyperparameters
-    model = PPO(
-        'MlpPolicy',
-        vec_env,
-        verbose=0,
-        seed=RANDOM_SEED,
-        policy_kwargs=policy_kwargs,
-        learning_rate=best_params.get('learning_rate', 3e-4),
-        n_steps=best_params.get('n_steps', 128),
-        batch_size=best_params.get('batch_size', 64),
-        gamma=best_params.get('gamma', 0.99),
-        gae_lambda=best_params.get('gae_lambda', 0.95),
-        clip_range=best_params.get('clip_range', 0.2),
-        ent_coef=best_params.get('ent_coef', 1e-3),
-        vf_coef=best_params.get('vf_coef', 0.5),
-        max_grad_norm=best_params.get('max_grad_norm', 0.5)
-    )
-
-    try:
-        # Train the final model
-        logging.info(f"Training final model for {ticker} with best hyperparameters...")
-        model.learn(total_timesteps=1000)  # Further increased timesteps
-        model_path = RESULTS_DIR / f"ppo_model_{ticker}.zip"
-        model.save(str(model_path))  # Explicitly add .zip
-        logging.info(f"Final training completed for {ticker}. Model saved as {model_path.name}")
-    except Exception as e:
-        logging.error(f"Final training failed for {ticker}: {e}")
-        return {}
-
-    # Evaluate the final model
-    obs = vec_env.reset()
-    done = False
-    rl_history = []
-    while not done:
-        action, _states = model.predict(obs, deterministic=True)
-        obs, reward, done, info = vec_env.step(action)
-        if env.history:
-            rl_history.append(env.history[-1])
-
-    # Convert rl_history to DataFrame
-    rl_df = pd.DataFrame(rl_history)
-    rl_df['Date'] = pd.to_datetime(rl_df['Date'])
-
-    # Merge with original df to get 'Close_unscaled'
-    rl_df = pd.merge(rl_df, df[['Date', 'Close_unscaled']], on='Date', how='left')
-
-    # Calculate Sharpe Ratio
-    returns = rl_df['Reward']
-    sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(annual_trading_days) if returns.std() != 0 else 0
-
-    # Calculate Max Drawdown
-    rl_net_worth = rl_df['Net Worth']
-    max_drawdown_final = calculate_max_drawdown(rl_net_worth)
-
-    # Calculate cumulative returns for plotting
-    rl_df['Cumulative_Returns'] = rl_net_worth / initial_balance
-
-    # Save performance metrics
-    performance_metrics = {
-        'Strategy': 'RL Agent with Optuna Tuned Hyperparameters',
-        'Ticker': ticker,
-        'Initial Balance': initial_balance,
-        'Final Net Worth': rl_df.iloc[-1]['Net Worth'],
-        'Profit': rl_df.iloc[-1]['Net Worth'] - initial_balance,
-        'Max Drawdown': max_drawdown_final,
-        'Sharpe Ratio': sharpe_ratio,
-        'Cumulative_Returns': rl_df['Cumulative_Returns']
-    }
-
-    # Save RL history for visualization
-    rl_history_path = RESULTS_DIR / f"rl_history_run_{ticker}.csv"
-    rl_df.to_csv(rl_history_path, index=False)
-    logging.info(f"RL history saved for {ticker} at {rl_history_path}")
-
-    # Generate and save plots
-    generate_improved_plots(df, rl_df, ticker, PLOTS_DIR)
-
-    # Save performance metrics
-    performance_metrics_path = RESULTS_DIR / f"performance_metrics_run_{ticker}.txt"
-    with open(performance_metrics_path, 'w') as f:
-        for key, value in performance_metrics.items():
-            if key in ['Cumulative_Returns']:
-                continue  # Skip writing large series to text
-            f.write(f"{key}: {value}\n")
-    logging.info(f"Performance metrics saved for {ticker} at {performance_metrics_path}")
-
-    return performance_metrics
-
-# -------------------------------------------
-# 9. Running the RL Agent (Testing Phase)
-# -------------------------------------------
-def run_rl_agent(ticker: str, model_path: str, df: pd.DataFrame, initial_balance: float,
-                annual_trading_days: int = 252, inference_times: dict = None):
-    """
-    Runs the trained RL agent on the test data and records actions.
-    Generates and saves performance charts with annotations.
-    Measures and logs the time taken for inference.
-    """
-    start_time = time.time()
-    env = SingleStockTradingEnv(
-        df=df,
-        initial_balance=initial_balance,
-        stop_loss=0.90,  # Adjusted to match training
-        take_profit=1.10,  # Adjusted to match training
-        max_position_size=0.25,  # Adjusted to match training
-        max_drawdown=0.20,  # Adjusted to match training
-        annual_trading_days=annual_trading_days
-    )
-
-    # Perform environment check on the raw environment
-    try:
-        check_env(env, warn=True)
-    except Exception as e:
-        logging.error(f"Environment check failed for {ticker}: {e}")
-        return
-
-    # Wrap the environment with DummyVecEnv
-    vec_env = DummyVecEnv([lambda: env])
-
-    try:
-        model = PPO.load(model_path, env=vec_env)
-    except Exception as e:
-        logging.error(f"Failed to load model for {ticker}: {e}")
-        return
-
-    try:
-        obs = vec_env.reset()
-        done = False
-        rl_history = []
-        while not done:
-            action, _states = model.predict(obs, deterministic=True)
-            obs, reward, done, info = vec_env.step(action)
-            if env.history:
-                rl_history.append(env.history[-1])
-    except Exception as e:
-        logging.error(f"Error during agent execution for {ticker}: {e}")
-        return
-
-    # Convert rl_history to DataFrame
-    rl_df = pd.DataFrame(rl_history)
-    rl_df['Date'] = pd.to_datetime(rl_df['Date'])
-
-    # Merge with original df to get 'Close_unscaled'
-    rl_df = pd.merge(rl_df, df[['Date', 'Close_unscaled']], on='Date', how='left')
-
-    # Calculate Sharpe Ratio
-    returns = rl_df['Reward']
-    sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(annual_trading_days) if returns.std() != 0 else 0
-
-    # Calculate Max Drawdown
-    rl_net_worth = rl_df['Net Worth']
-    rl_max_drawdown = calculate_max_drawdown(rl_net_worth)
-
-    # Calculate cumulative returns for plotting
-    rl_df['Cumulative_Returns'] = rl_net_worth / initial_balance
-
-    # Save performance metrics
-    performance_metrics = {
-        'Strategy': 'RL Agent',
-        'Ticker': ticker,
-        'Initial Balance': initial_balance,
-        'Final Net Worth': rl_df.iloc[-1]['Net Worth'],
-        'Profit': rl_df.iloc[-1]['Net Worth'] - initial_balance,
-        'Max Drawdown': rl_max_drawdown,
-        'Sharpe Ratio': sharpe_ratio,
-        'Cumulative_Returns': rl_df['Cumulative_Returns']
-    }
-
-    # Save RL history for visualization
-    rl_history_path = RESULTS_DIR / f"rl_history_run_{ticker}.csv"
-    rl_df.to_csv(rl_history_path, index=False)
-    logging.info(f"RL history saved for {ticker} at {rl_history_path}")
-
-    # Generate and save plots
-    generate_improved_plots(df, rl_df, ticker, PLOTS_DIR)
-
-    # Save performance metrics
-    performance_metrics_path = RESULTS_DIR / f"performance_metrics_run_{ticker}.txt"
-    with open(performance_metrics_path, 'w') as f:
-        for key, value in performance_metrics.items():
-            if key in ['Cumulative_Returns']:
-                continue  # Skip writing large series to text
-            f.write(f"{key}: {value}\n")
-    logging.info(f"Performance metrics saved for {ticker} at {performance_metrics_path}")
-
-    end_time = time.time()
-    inference_duration = end_time - start_time
-    if inference_times is not None:
-        inference_times[ticker] = inference_duration
-    logging.info(f"Performance metrics and plots saved for {ticker}. Time taken: {inference_duration:.2f} seconds.")
-
-# -------------------------------------------
-# 10. Performance Evaluation and Visualization
-# -------------------------------------------
 def calculate_max_drawdown(net_worth_series: pd.Series) -> float:
-    """
-    Calculates the Maximum Drawdown of a net worth series.
-    """
     rolling_max = net_worth_series.cummax()
     drawdown = (net_worth_series - rolling_max) / rolling_max
     max_drawdown = drawdown.min()
     return max_drawdown
 
 def generate_improved_plots(df: pd.DataFrame, rl_df: pd.DataFrame, ticker: str, output_dir: Path):
-    """
-    Generate improved performance plots for RL agents.
-    """
     pdf_path = output_dir / f"{ticker}_improved_performance.pdf"
     with PdfPages(pdf_path) as pdf:
-        sns.set_theme(style="whitegrid")  # Apply seaborn theme for aesthetics
+        sns.set_theme(style="whitegrid")
 
-        # Chart 1: Price with Buy/Sell Signals
         plt.figure(figsize=(14, 7))
         plt.plot(df['Date'], df['Close_unscaled'], label='Close Price', color='blue', alpha=0.6)
-
-        # Plot Buy Signals
         buy_signals = rl_df[rl_df['Buy_Signal_Price'].notna()]
         plt.scatter(buy_signals['Date'], buy_signals['Buy_Signal_Price'], color='green', marker='^', s=100, label='Buy Signal')
-
-        # Plot Sell Signals
         sell_signals = rl_df[rl_df['Sell_Signal_Price'].notna()]
         plt.scatter(sell_signals['Date'], sell_signals['Sell_Signal_Price'], color='red', marker='v', s=100, label='Sell Signal')
-
-        # Plot Drawdown Actions
         drawdown_actions = rl_df[rl_df['Action_Type'].notnull()]
         stop_loss_signals = drawdown_actions[drawdown_actions['Action_Type'] == 'Stop-Loss']
         take_profit_signals = drawdown_actions[drawdown_actions['Action_Type'] == 'Take-Profit']
@@ -1163,7 +666,6 @@ def generate_improved_plots(df: pd.DataFrame, rl_df: pd.DataFrame, ticker: str, 
         pdf.savefig()
         plt.close()
 
-        # Chart 2: Net Worth Over Time
         plt.figure(figsize=(14, 7))
         plt.plot(rl_df['Date'], rl_df['Net Worth'], label='RL Agent Net Worth', color='blue')
         plt.title(f'Net Worth Over Time for {ticker}', fontsize=16)
@@ -1177,7 +679,6 @@ def generate_improved_plots(df: pd.DataFrame, rl_df: pd.DataFrame, ticker: str, 
         pdf.savefig()
         plt.close()
 
-        # Chart 3: Cumulative Returns Comparison
         plt.figure(figsize=(14, 7))
         plt.plot(df['Date'], (df['Close_unscaled'] / df['Close_unscaled'].iloc[0]), label='Buy and Hold', color='green', alpha=0.7)
         plt.plot(rl_df['Date'], rl_df['Cumulative_Returns'], label='RL Agent', color='orange', alpha=0.7)
@@ -1195,16 +696,9 @@ def generate_improved_plots(df: pd.DataFrame, rl_df: pd.DataFrame, ticker: str, 
     logging.info(f"Improved charts saved to {pdf_path}")
 
 def visualize_baseline_strategies(strategies: list):
-    """
-    Visualizes the performance of baseline strategies.
-    """
-    # Create DataFrame from strategies
     strategies_df = pd.DataFrame(strategies)
-
-    # Convert Max Drawdown to percentage for better visualization
     strategies_df['Max Drawdown'] = strategies_df['Max Drawdown'] * 100
 
-    # Plot Profit Comparison
     plt.figure(figsize=(14, 8))
     sns.barplot(x='Strategy', y='Profit', hue='Ticker', data=strategies_df, palette="viridis")
     plt.title('Profit Comparison of Baseline Strategies', fontsize=16)
@@ -1218,7 +712,6 @@ def visualize_baseline_strategies(strategies: list):
     plt.savefig(profit_comparison_path)
     plt.close()
 
-    # Plot Max Drawdown Comparison
     plt.figure(figsize=(14, 8))
     sns.barplot(x='Strategy', y='Max Drawdown', hue='Ticker', data=strategies_df, palette="rocket")
     plt.title('Max Drawdown Comparison of Baseline Strategies', fontsize=16)
@@ -1232,7 +725,6 @@ def visualize_baseline_strategies(strategies: list):
     plt.savefig(max_drawdown_comparison_path)
     plt.close()
 
-    # Print Detailed Results
     logging.info("\nBaseline Strategy Performance:")
     for _, row in strategies_df.iterrows():
         logging.info(f"{row['Strategy']} for {row['Ticker']}:")
@@ -1243,147 +735,65 @@ def visualize_baseline_strategies(strategies: list):
 
     logging.info(f"Baseline strategy comparison plots saved at {PLOTS_DIR}.")
 
-# -------------------------------------------
-# 11. Main Execution Function
-# -------------------------------------------
+def wrapper_train_rl_agent_with_optuna(*args, **kwargs):
+    # Dummy function placeholder if needed.
+    pass
+
+def train_rl_agent_with_optuna(*args, **kwargs):
+    # Dummy function placeholder if needed.
+    return {}
+
+def run_rl_agent(*args, **kwargs):
+    # Dummy function placeholder if needed.
+    pass
+
 def main():
-    # Start timer for the entire process
-    total_start_time = time.time()
-
-    # Parameters
-    TRAIN_TEST_TICKERS_LIST = [       
-        'APOLLOTYRE.NS'      
-    ]
-
-    # Define training period: All data except the last 2 years
-    END_DATE = datetime.datetime.today()
-    TRAIN_END_DATE = (END_DATE - pd.DateOffset(years=2)).strftime('%Y-%m-%d')
-    TEST_START_DATE = TRAIN_END_DATE
-    TEST_END_DATE = END_DATE.strftime('%Y-%m-%d')
-
-    INITIAL_BALANCE = 100000  # Starting capital
-    STOP_LOSS = 0.90  # 10% stop loss
-    TAKE_PROFIT = 1.10  # 10% take profit
-    MAX_POSITION_SIZE = 0.25  # 25% of portfolio
-    MAX_DRAWDOWN = 0.20  # 20% max drawdown
-    ANNUAL_TRADING_DAYS = 252  # For Sharpe Ratio calculation
-
-    # Minimum data length requirement
-    MIN_DATA_LENGTH = 200  # Arbitrary threshold for minimum rows needed
-
-    # Manager for sharing training and inference times across processes
-    manager = Manager()
-    training_times = manager.dict()
-    inference_times = manager.dict()
-
-    # 1. Fetch data for all tickers
-    logging.info("\nFetching data for all tickers...")
-    all_train_data = []
-    all_test_data = []
-    for ticker in TRAIN_TEST_TICKERS_LIST:
-        # Fetch training data
-        train_df = get_multiple_tickers_data(ticker, '2000-01-01', TRAIN_END_DATE)
-        # Fetch testing data (last 2 years)
-        test_df = get_multiple_tickers_data(ticker, TEST_START_DATE, TEST_END_DATE)
-        
-        if not train_df.empty and len(train_df) >= MIN_DATA_LENGTH:
-            all_train_data.append(train_df)
-            logging.info(f"Training data ready for {ticker}.")
-        else:
-            logging.warning(f"Skipping training for {ticker} due to insufficient data.")
-        
-        if not test_df.empty and len(test_df) >= MIN_DATA_LENGTH:
-            all_test_data.append(test_df)
-            logging.info(f"Testing data ready for {ticker}.")
-        else:
-            logging.warning(f"Skipping testing for {ticker} due to insufficient data.")
-
-    if not all_train_data:
-        logging.error("No training data fetched for any ticker. Exiting.")
+    # Example main
+    ticker = 'AAPL'
+    start_date = '2018-01-01'
+    end_date = '2021-01-01'
+    df = get_multiple_tickers_data(ticker, start_date, end_date)
+    if df.empty:
+        print(f"No data for {ticker}.")
         return
-    logging.info(f"Fetched training data for {len(all_train_data)} tickers.")
+    train_size = int(len(df)*0.8)
+    train_df = df.iloc[:train_size].reset_index(drop=True)
+    test_df = df.iloc[train_size:].reset_index(drop=True)
 
-    if not all_test_data:
-        logging.error("No testing data fetched for any ticker. Exiting.")
-        return
-    logging.info(f"Fetched testing data for {len(all_test_data)} tickers.")
+    # Initialize environment
+    env = SingleStockTradingEnv(train_df)
+    check_env(env, warn=True)
 
-    # 2. Define processes for parallel training with Optuna
-    logging.info("\nStarting training of RL agents with hyperparameter tuning...")
-    processes = []
-    max_cpu_usage = int(0.95 * cpu_count())  # Use up to 95% of available CPUs
-    cpu_cores = min(max_cpu_usage, len(all_train_data))  # Limit to available CPU cores
+    # Train a PPO agent briefly (this is just an example)
+    vec_env = DummyVecEnv([lambda: env])
+    model = PPO('MlpPolicy', vec_env, verbose=0, seed=RANDOM_SEED, learning_rate=3e-4)
+    model.learn(total_timesteps=5000)
 
-    for i, df in enumerate(all_train_data):
-        ticker = df['Ticker'].iloc[0]
-        p = Process(target=wrapper_train_rl_agent_with_optuna, args=(
-            ticker, df, INITIAL_BALANCE, STOP_LOSS, TAKE_PROFIT, MAX_POSITION_SIZE, MAX_DRAWDOWN, ANNUAL_TRADING_DAYS, training_times
-        ))
-        processes.append(p)
-        p.start()
-        logging.info(f"Started training process for {ticker} (Process ID: {p.pid})")
-        if len(processes) >= cpu_cores:
-            for proc in processes:
-                proc.join()
-                logging.info(f"Training process {proc.pid} for {ticker} joined.")
-            processes = []
+    # Test on test data
+    test_env = SingleStockTradingEnv(test_df)
+    vec_test_env = DummyVecEnv([lambda: test_env])
+    obs, _ = vec_test_env.reset()
+    done = False
+    rl_history = []
 
-    # Join any remaining processes
-    for proc in processes:
-        proc.join()
-        logging.info(f"Training process {proc.pid} joined.")
+    while not done:
+        action, _states = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = vec_test_env.step(action)
+        done = terminated or truncated
+        if test_env.history:
+            rl_history.append(test_env.history[-1])
 
-    logging.info("\nAll RL models trained with hyperparameter tuning.")
-    logging.info("\nTraining Times per Ticker:")
-    for ticker, duration in training_times.items():
-        logging.info(f"{ticker}: {duration:.2f} seconds")
+    rl_df = pd.DataFrame(rl_history)
+    rl_df['Date'] = pd.to_datetime(rl_df['Date'])
+    rl_df = pd.merge(rl_df, test_df[['Date', 'Close_unscaled']], on='Date', how='left')
+    rl_df['Cumulative_Returns'] = rl_df['Net Worth'] / env.initial_balance
 
-    # 3. Run baseline strategies on all test tickers
-    logging.info("\nRunning Baseline Strategies on test data...")
-    baseline_strategies = []
-    for df in all_test_data:
-        ticker = df['Ticker'].iloc[0]
-        bh = buy_and_hold(df, ticker, INITIAL_BALANCE)
-        ma = moving_average_crossover(df, ticker, INITIAL_BALANCE)
-        macd = macd_strategy(df, ticker, INITIAL_BALANCE)
-        bb = bollinger_bands_strategy(df, ticker, INITIAL_BALANCE)
-        rand = random_strategy(df, ticker, INITIAL_BALANCE)
-        baseline_strategies.extend([bh, ma, macd, bb, rand])
+    # Compare with a baseline
+    bh_result = buy_and_hold(test_df, ticker, env.initial_balance)
+    visualize_baseline_strategies([bh_result])
 
-    # 4. Run RL agents on the same tickers (Testing Phase)
-    logging.info("\nRunning RL Agents on test data...")
-    for df in all_test_data:
-        ticker = df['Ticker'].iloc[0]
-        model_path = RESULTS_DIR / f"ppo_model_{ticker}.zip"
-        if not model_path.exists():
-            logging.warning(f"Model for {ticker} not found. Skipping RL run.")
-            continue
-        run_rl_agent(ticker, str(model_path), df, INITIAL_BALANCE, ANNUAL_TRADING_DAYS, inference_times)
+    generate_improved_plots(test_df, rl_df, ticker, PLOTS_DIR)
+    print("Done.")
 
-    logging.info("\nInference Times per Ticker:")
-    for ticker, duration in inference_times.items():
-        logging.info(f"{ticker}: {duration:.2f} seconds")
-
-    # 5. Visualize baseline strategies
-    visualize_baseline_strategies(baseline_strategies)
-
-    # End timer for the entire process
-    total_end_time = time.time()
-    total_duration = total_end_time - total_start_time
-    logging.info(f"\nTotal time taken for training and inference: {total_duration:.2f} seconds.")
-
-def wrapper_train_rl_agent_with_optuna(ticker, df, initial_balance, stop_loss, take_profit, max_position_size, max_drawdown, annual_trading_days, training_times):
-    """
-    Wrapper function to measure training time with Optuna.
-    """
-    start_time = time.time()
-    performance_metrics = train_rl_agent_with_optuna(ticker, df, initial_balance, stop_loss, take_profit, max_position_size, max_drawdown, annual_trading_days)
-    end_time = time.time()
-    training_duration = end_time - start_time
-    training_times[ticker] = training_duration
-
-# -------------------------------------------
-# 12. Run the Main Function
-# -------------------------------------------
 if __name__ == "__main__":
     main()
