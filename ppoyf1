@@ -8,7 +8,7 @@ from ta import trend, momentum, volatility, volume
 import matplotlib.pyplot as plt
 import seaborn as sns
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
 import torch
@@ -25,7 +25,7 @@ import joblib
 import time
 import multiprocessing
 
-# Import ConcurrentRotatingFileHandler
+# Import ConcurrentRotatingFileHandler for robust multi-process logging
 try:
     from concurrent_log_handler import ConcurrentRotatingFileHandler
 except ImportError:
@@ -61,16 +61,26 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 TB_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Configure logging with ConcurrentRotatingFileHandler
-log_file = RESULTS_DIR / 'training.log'
-handler = ConcurrentRotatingFileHandler(str(log_file), maxBytes=10**6, backupCount=5)
+# Print the absolute paths
+print(f"Base Directory: {BASE_DIR}")
+print(f"Results Directory: {RESULTS_DIR}")
+print(f"Plots Directory: {PLOTS_DIR}")
+print(f"TensorBoard Logs Directory: {TB_LOG_DIR}")
+
+# Configure Logging
+logging.basicConfig(level=logging.DEBUG)  # Set to DEBUG for detailed logs
+logger = logging.getLogger()
+logger.handlers = []  # Remove any default handlers
+handler = ConcurrentRotatingFileHandler(str(RESULTS_DIR / 'training.log'), maxBytes=10**6, backupCount=5)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
-
-# Add handler to the root logger
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs; adjust as needed
 logger.addHandler(handler)
+
+# Log the absolute paths
+logging.info(f"Base Directory: {BASE_DIR}")
+logging.info(f"Results Directory: {RESULTS_DIR}")
+logging.info(f"Plots Directory: {PLOTS_DIR}")
+logging.info(f"TensorBoard Logs Directory: {TB_LOG_DIR}")
 
 ##############################################
 # Version Checks
@@ -185,11 +195,13 @@ def get_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     df['SMA50_unscaled'] = df['SMA50']
     df['RSI_unscaled'] = df['RSI']
     df['MACD_unscaled'] = df['MACD']
+    df['ADX_unscaled'] = df['ADX']
     df['BB_Upper_unscaled'] = df['BB_Upper']
     df['BB_Lower_unscaled'] = df['BB_Lower']
     df['EMA20_unscaled'] = df['EMA20']
     df['VWAP_unscaled'] = df['VWAP']
     df['Bollinger_Width_unscaled'] = df['Bollinger_Width']
+    df['Lagged_Return_unscaled'] = df['Lagged_Return']
     df['Volatility_unscaled'] = df['Volatility']
 
     # Handle missing values
@@ -211,17 +223,14 @@ def get_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     joblib.dump(scaler, scaler_filename)
     logging.info(f"Scaler fitted on training data and saved as {scaler_filename}")
 
-    # *** Removed Redundant Concatenation ***
-    # The following line is redundant because unscaled features are already part of the DataFrame.
-    # Uncommenting this could lead to duplicate columns or KeyErrors if any unscaled feature is missing.
-    # df = pd.concat([df, df[UNSCALED_FEATURES]], axis=1)
-
-    # *** Added Debugging to Verify Columns ***
+    # Check for missing unscaled features
     missing_unscaled = [feature for feature in UNSCALED_FEATURES if feature not in df.columns]
     if missing_unscaled:
         logging.error(f"Missing unscaled features after processing: {missing_unscaled}")
     else:
         logging.debug("All unscaled features are present in the DataFrame.")
+        logging.debug(f"DataFrame columns: {df.columns.tolist()}")
+        logging.debug(f"First 5 rows:\n{df.head()}")
 
     logging.info(f"Data for {ticker} fetched and processed successfully.")
     return df
@@ -240,8 +249,11 @@ class SingleStockTradingEnv(gym.Env):
                  initial_balance: float = 100000,
                  stop_loss: float = 0.90, take_profit: float = 1.10,
                  max_position_size: float = 0.25, max_drawdown: float = 0.20,
-                 annual_trading_days: int = 252, transaction_cost: float = 0.001):
+                 annual_trading_days: int = 252, transaction_cost: float = 0.001,
+                 env_rank: int = 0):
         super(SingleStockTradingEnv, self).__init__()
+
+        self.env_rank = env_rank  # Unique identifier for the environment
 
         self.df = df.copy().reset_index(drop=True)
         self.scaler = scaler
@@ -268,9 +280,6 @@ class SingleStockTradingEnv(gym.Env):
 
         self.feature_names = FEATURES_TO_SCALE
 
-        # Parameters for limiting buy fractions
-        self.MAX_BUY_FRACTION = 0.5  # Prevent full cash depletion
-
         # Risk Management Parameters
         self.dynamic_drawdown = True  # Enable dynamic drawdown
         self.volatility_window = 14  # Number of periods to calculate rolling ATR
@@ -280,6 +289,18 @@ class SingleStockTradingEnv(gym.Env):
 
         # Initialize environment state
         self.reset()
+
+    def seed(self, seed=None):
+        """
+        Sets the seed for the environment's random number generators.
+
+        Args:
+            seed (int, optional): Seed value. Defaults to None.
+        """
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        logging.debug(f"[Env {self.env_rank}] Seed set to {seed}")
 
     def _next_observation(self) -> np.ndarray:
         """
@@ -297,9 +318,14 @@ class SingleStockTradingEnv(gym.Env):
         obs.append(self.position / self.initial_balance)
 
         # Determine market phase
-        adx = float(current_data['ADX'])  # Convert ADX to float
+        try:
+            adx = float(current_data['ADX_unscaled'])  # Ensure this matches the DataFrame's feature name
+        except KeyError:
+            logging.error(f"[Env {self.env_rank}] 'ADX_unscaled' not found in current_data at step {self.current_step}. Setting ADX to 0.")
+            adx = 0.0
+
         if adx > 25:
-            if float(current_data['SMA10']) > float(current_data['SMA50']):
+            if float(current_data['SMA10_unscaled']) > float(current_data['SMA50_unscaled']):
                 phase = 'Bull'
             else:
                 phase = 'Bear'
@@ -349,109 +375,141 @@ class SingleStockTradingEnv(gym.Env):
             - info (dict): Additional information.
         """
         try:
+            # Prevent buying immediately after selling and vice versa
+            if (self.last_action == 1 and action == 2) or (self.last_action == 2 and action == 1):
+                logging.warning(f"[Env {self.env_rank}] Step {self.current_step}: Prevented action {action} following action {self.last_action}")
+                action = 0  # Force Hold action
+
             # Validate action
-            assert self.action_space.contains(action), f"Invalid action: {action}"
+            assert self.action_space.contains(action), f"[Env {self.env_rank}] Invalid action: {action}"
 
             # Fetch current data
+            if self.current_step >= len(self.df):
+                logging.debug(f"[Env {self.env_rank}] Current step {self.current_step} exceeds data length. Terminating episode.")
+                terminated = True
+                truncated = False
+                reward = -1000  # Penalty for exceeding data
+                obs = self._next_observation()
+                logging.error(f"[Env {self.env_rank}] Terminating episode at step {self.current_step} due to data overflow.")
+                return obs, reward, terminated, truncated, {}
+
             current_data = self.df.iloc[self.current_step]
             current_price = float(current_data['Close_unscaled'])
             buy_signal_price = np.nan
             sell_signal_price = np.nan
-            reward = 0.0
+
+            # Initialize reward components
+            reward_profit = 0.0
+            reward_sharpe = 0.0
+            reward_sortino = 0.0
+            reward_costs = 0.0
+            reward_drawdown = 0.0
+            reward_inactivity = 0.0
+
+            # Initialize shares_to_sell to prevent reference before assignment
+            shares_to_sell = 0
 
             # Handle actions
             if action == 1:  # Buy
-                # Dynamic Position Sizing based on risk (e.g., ATR)
-                atr = float(current_data['Volatility'])  # Average True Range as volatility measure
-                risk_per_trade = 0.01  # 1% risk per trade
-                position_size = (self.balance * risk_per_trade) / (atr + 1e-8)  # Avoid division by zero
-                shares_to_buy = math.floor(self.MAX_BUY_FRACTION * position_size / current_price)
-                if shares_to_buy > 0 and self.balance >= shares_to_buy * current_price:
-                    cost = shares_to_buy * current_price * self.transaction_cost
-                    self.balance -= shares_to_buy * current_price + cost
-                    self.position += shares_to_buy
-                    self.total_buy_cost += shares_to_buy * current_price
-                    buy_signal_price = current_price
-                    logging.debug(f"Step {self.current_step}: Bought {shares_to_buy} shares at {current_price:.2f}")
-                    reward -= 0.01  # Small penalty for buying to discourage unnecessary trades
-
+                shares_to_buy = math.floor(self.max_position_size * self.balance / current_price)
+                if shares_to_buy > 0:
+                    cost = shares_to_buy * current_price * (1 + self.transaction_cost)
+                    if self.balance >= cost:
+                        self.balance -= cost
+                        self.position += shares_to_buy
+                        buy_signal_price = current_price
+                        logging.debug(f"[Env {self.env_rank}] Step {self.current_step}: Bought {shares_to_buy} shares at {current_price:.2f}")
+                        self.last_action = 1  # Update last action
+                        # For transaction costs reward component
+                        reward_costs = -self.transaction_cost * shares_to_buy
             elif action == 2:  # Sell
-                shares_to_sell = math.floor(self.position * 0.5)  # Sell 50% of holdings
+                shares_to_sell = math.floor(0.5 * self.position)  # Sell 50% of holdings
                 if shares_to_sell > 0:
-                    proceeds = shares_to_sell * current_price
-                    cost = proceeds * self.transaction_cost
-                    self.balance += proceeds - cost
+                    proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                    self.balance += proceeds
                     self.position -= shares_to_sell
-                    self.total_shares_sold += shares_to_sell
-                    self.total_sales_value += proceeds
                     sell_signal_price = current_price
-                    logging.debug(f"Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
-                    reward -= 0.01  # Small penalty for selling to discourage unnecessary trades
+                    logging.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
+                    self.last_action = 2  # Update last action
+                    # For transaction costs reward component
+                    reward_costs = -self.transaction_cost * shares_to_sell
+            else:
+                self.last_action = 0  # Reset last action on Hold
 
             # Update net worth
             self.net_worth = self.balance + self.position * current_price
 
-            # Calculate reward based on net worth growth and risk-adjusted measures
+            # Reward Components
+            # (1) Profitability: Net worth change
             net_worth_change = self.net_worth - self.prev_net_worth
-            reward += net_worth_change / (self.prev_net_worth + 1e-8)  # Basic return-based reward
+            reward_profit = net_worth_change / (self.prev_net_worth + 1e-8)
 
-            # Incorporate Sharpe Ratio component
-            returns = np.array([h['Reward'] for h in self.history])
-            if len(returns) > 0 and returns.std() != 0:
-                sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(self.annual_trading_days)
-                reward += sharpe_ratio * 0.1  # Scale to balance with return-based reward
+            # Initialize returns_window if not present
+            if not hasattr(self, 'returns_window'):
+                self.returns_window = []
 
-            # Smooth and scale the reward
-            reward = np.tanh(reward)  # Prevent large variations
-            reward *= 100  # Scale reward
+            # (2) Sharpe Ratio: Risk-adjusted performance
+            self.returns_window.append(net_worth_change / (self.prev_net_worth + 1e-8))
+            if len(self.returns_window) > self.annual_trading_days:  # Use annual trading days for rolling Sharpe
+                self.returns_window.pop(0)
+            if len(self.returns_window) > 1:
+                returns = np.array(self.returns_window)
+                mean_return = returns.mean()
+                std_return = returns.std() + 1e-8  # Avoid division by zero
+                reward_sharpe = (mean_return / std_return) * math.sqrt(self.annual_trading_days)
+                # (3) Sortino Ratio
+                downside_returns = returns[returns < 0]
+                downside_std = downside_returns.std() * math.sqrt(self.annual_trading_days) if len(downside_returns) > 0 else 0.0
+                reward_sortino = (mean_return / (downside_std + 1e-8)) if downside_std > 0 else 0.0
 
-            logging.debug(f"Step {self.current_step}: Reward = {reward:.4f}, Net Worth = {self.net_worth:.2f}, Previous Net Worth = {self.prev_net_worth:.2f}")
+            # (4) Drawdown Penalty
+            if self.dynamic_drawdown:
+                self.current_drawdown = self._calculate_dynamic_drawdown()
+            else:
+                self.current_drawdown = self.base_drawdown
 
-            # Update peak and calculate drawdown
             self.peak = max(self.peak, self.net_worth)
             drawdown = (self.net_worth - self.peak) / self.peak
-            logging.debug(f"Step {self.current_step}: Drawdown = {drawdown:.4f}")
-
-            # Update dynamic drawdown threshold
-            self.current_drawdown = self._calculate_dynamic_drawdown()
-            logging.debug(f"Step {self.current_step}: Dynamic Drawdown Threshold = {self.current_drawdown:.4f}")
-
-            # Penalize excessive drawdown
             if drawdown < -self.current_drawdown:
-                penalty = min(100 * abs(drawdown / self.current_drawdown), 100)  # Cap penalty at 100
-                reward -= penalty
-                logging.error(f"Step {self.current_step}: Drawdown of {drawdown:.2f} exceeded. Penalty: {penalty:.2f}")
+                reward_drawdown = min(-abs(drawdown) * 100, -100)  # Scale and cap penalty
 
-                # Liquidate positions to cut losses
-                if self.position > 0:
-                    shares_to_sell = math.floor(self.position)
-                    if shares_to_sell > 0:
-                        proceeds = shares_to_sell * current_price
-                        cost = proceeds * self.transaction_cost
-                        self.balance += proceeds - cost
-                        self.position -= shares_to_sell
-                        self.total_shares_sold += shares_to_sell
-                        self.total_sales_value += proceeds
-                        logging.debug(f"Step {self.current_step}: Liquidated {shares_to_sell} shares at {current_price:.2f} due to excessive drawdown.")
-
-            # Apply inactivity penalty
+            # (5) Inactivity Penalty
             if abs(self.position) < 1e-3:
-                reward -= 0.1  # Small penalty to encourage active trading
-                logging.debug(f"Step {self.current_step}: Inactivity penalty applied.")
+                reward_inactivity = -0.1  # Small penalty for inactivity
 
-            # Check for bankruptcy
+            # Combine reward components
+            # Revised weights for balanced contribution
+            weight_profit = 10
+            weight_sharpe = 5
+            weight_sortino = 5
+            weight_drawdown = 2
+            weight_inactivity = 0.1
+
+            reward = (
+                weight_profit * np.tanh(reward_profit) +
+                weight_sharpe * reward_sharpe +
+                weight_sortino * reward_sortino +
+                reward_costs +
+                weight_drawdown * reward_drawdown +
+                weight_inactivity * reward_inactivity
+            )
+
+            # Avoid excessive clamping to retain information on extreme cases
+            reward = max(-1000, min(reward, 1000))  # Clamp rewards between -1000 and +1000
+            logging.debug(f"[Env {self.env_rank}] Step {self.current_step}: Reward = {reward:.4f}, "
+                          f"Net Worth = {self.net_worth:.2f}, Previous Net Worth = {self.prev_net_worth:.2f}")
+
+            # Check for episode termination
+            terminated = False
+            truncated = False
+
             if self.net_worth <= 0:
-                if self.position > 0:
-                    transaction_fee = self.position * current_price * self.transaction_cost
-                    self.balance += self.position * current_price - transaction_fee
-                    logging.error(f"Bankruptcy triggered. Liquidated {self.position} shares at {current_price:.2f}. "
-                                  f"Transaction fee: {transaction_fee:.2f}. New balance: {self.balance:.2f}")
-                    self.position = 0
-                reward -= 1000
-                terminated, truncated = True, True
-                logging.error(f"Step {self.current_step}: Bankruptcy occurred. Episode terminated.")
-            else:
-                terminated, truncated = False, False
+                terminated = True
+                reward -= 1000  # Severe penalty for bankruptcy
+                logging.error(f"[Env {self.env_rank}] Bankruptcy occurred. Terminating episode at step {self.current_step}.")
+            elif self.current_step >= len(self.df) - 1:
+                terminated = True
+                logging.info(f"[Env {self.env_rank}] Reached end of data at step {self.current_step}. Terminating episode.")
 
             # Append to history
             self.history.append({
@@ -462,44 +520,40 @@ class SingleStockTradingEnv(gym.Env):
                 'Net Worth': self.net_worth,
                 'Reward': reward,
                 'Buy_Signal_Price': buy_signal_price,
-                'Sell_Signal_Price': sell_signal_price
+                'Sell_Signal_Price': sell_signal_price,
+                'Action': action  # Log the action taken
             })
 
-            # Log history with proper formatting
-            if self.history:
-                last_history = self.history[-1]
-                logging.debug(f"History: Step={last_history['Step']}, Date={last_history['Date']}, "
-                              f"Balance=${last_history['Balance']:.2f}, Position={last_history['Position']}, "
-                              f"Net Worth=${last_history['Net Worth']:.2f}, Reward={last_history['Reward']:.4f}, "
-                              f"Buy_Signal_Price={last_history['Buy_Signal_Price']}, "
-                              f"Sell_Signal_Price={last_history['Sell_Signal_Price']}")
-
-            # Update previous net worth
-            self.prev_net_worth = self.net_worth
-
-            # Check for termination before incrementing
-            if self.current_step >= len(self.df) - 1:
-                terminated = True
-                logging.debug(f"Step {self.current_step}: Reached end of data. Episode terminated.")
+            # Advance to next step if not terminated
+            if not terminated:
+                self.prev_net_worth = self.net_worth
+                logging.debug(f"[Env {self.env_rank}] Before increment: Step {self.current_step}")
+                self.current_step += 1  # Ensure step increments
+                logging.debug(f"[Env {self.env_rank}] After increment: Step {self.current_step}")
             else:
-                self.current_step += 1
+                # If terminated, do not increment step to prevent overshooting
+                logging.debug(f"[Env {self.env_rank}] Episode terminated at step {self.current_step}")
 
-            # Prepare next observation
+            # Ensure current_step does not exceed data length
+            self.current_step = min(self.current_step, len(self.df) - 1)
+
+            # Observation after action
             obs = self._next_observation()
-            info = {
-                "current_price": current_price,
-                "drawdown": drawdown,
-                "buy_signal_price": buy_signal_price,
-                "sell_signal_price": sell_signal_price,
-            }
-            logging.debug(f"Step {self.current_step}: Step completed. Terminated: {terminated}, Truncated: {truncated}")
 
-            return obs, reward, terminated, truncated, info
+            # Logging every 100 steps or upon termination
+            if self.current_step % 100 == 0 or terminated:
+                logging.debug(f"[Env {self.env_rank}] Step {self.current_step}: Reward = {reward:.4f}, "
+                              f"Net Worth = {self.net_worth:.2f}, Balance = {self.balance:.2f}, Position = {self.position}")
 
+            # Log detailed state changes
+            logging.debug(f"[Env {self.env_rank}] After Action {action}: Balance = {self.balance}, Position = {self.position}, Net Worth = {self.net_worth}")
+
+            return obs, reward, terminated, truncated, {}
+			
         except Exception as e:
             logging.critical(f"Error during step execution: {e}")
             raise e
-
+			
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[np.ndarray, dict]:
         """
         Resets the environment to an initial state.
@@ -512,7 +566,7 @@ class SingleStockTradingEnv(gym.Env):
         try:
             super().reset(seed=seed)
         except Exception as e:
-            logging.critical(f"Superclass reset failed: {e}")
+            logging.critical(f"[Env {self.env_rank}] Superclass reset failed: {e}")
             raise e  # Re-raise the exception after logging
 
         try:
@@ -521,26 +575,17 @@ class SingleStockTradingEnv(gym.Env):
             self.net_worth = self.initial_balance
             self.prev_net_worth = self.initial_balance
             self.peak = self.initial_balance
-            self.total_buy_cost = 0.0
-            self.total_shares_sold = 0.0
-            self.total_sales_value = 0.0
             self.current_step = 0
             self.history = []
+            self.last_action = 0  # Initialize last action as Hold
+            self.returns_window = []
             obs = self._next_observation()
             info = {}  # Return an empty info dictionary
-            logging.info("Environment reset successfully. History cleared and step reset to 0.")
+            logging.info(f"[Env {self.env_rank}] Environment reset successfully. History cleared and step reset to 0.")
             return obs, info  # Return both obs and info
         except Exception as e:
-            logging.critical(f"Error during environment reset: {e}")
+            logging.critical(f"[Env {self.env_rank}] Error during environment reset: {e}")
             raise e  # Re-raise the exception after logging
-
-    def render(self, mode='human', close=False):
-        """
-        Renders the environment.
-        """
-        profit = self.net_worth - self.initial_balance
-        print(f'Step: {self.current_step}, Balance: ${self.balance:.2f}, Position: {self.position:.4f}, '
-              f'Net Worth: ${self.net_worth:.2f}, Profit: ${profit:.2f}')
 
 ##############################################
 # Baseline Strategies
@@ -596,21 +641,21 @@ def moving_average_crossover(df: pd.DataFrame, initial_balance: float = 100000, 
 
     for i in range(1, len(df)):
         # Golden cross with RSI < 30
-        if df.loc[i-1, 'SMA10'] < df.loc[i-1, 'SMA50'] and df.loc[i, 'SMA10'] >= df.loc[i, 'SMA50']:
-            if df.loc[i, 'RSI'] < 30:
+        if df.loc[i-1, 'SMA10_unscaled'] < df.loc[i-1, 'SMA50_unscaled'] and df.loc[i, 'SMA10_unscaled'] >= df.loc[i, 'SMA50_unscaled']:
+            if df.loc[i, 'RSI_unscaled'] < 30:
                 # Buy
                 atr = float(df.loc[i, 'Volatility'])  # ATR as volatility measure
                 risk_per_trade = 0.01  # 1% risk per trade
                 position_size = (balance * risk_per_trade) / (atr + 1e-8)  # Avoid division by zero
-                shares_to_buy = math.floor(0.5 * (max_position_size := 0.25) * balance / df.loc[i, 'Close_unscaled'])
+                shares_to_buy = math.floor(max_position_size := 0.25 * balance / df.loc[i, 'Close_unscaled'])
                 if shares_to_buy > 0 and balance >= shares_to_buy * df.loc[i, 'Close_unscaled']:
                     cost = shares_to_buy * df.loc[i, 'Close_unscaled'] * transaction_cost
                     holdings += shares_to_buy
                     balance -= shares_to_buy * df.loc[i, 'Close_unscaled'] + cost
-                    logging.debug(f"MA Crossover: Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                    logging.debug(f"[Strategy: MA Crossover] Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         # Death cross with RSI > 70
-        elif df.loc[i-1, 'SMA10'] > df.loc[i-1, 'SMA50'] and df.loc[i, 'SMA10'] <= df.loc[i, 'SMA50']:
-            if df.loc[i, 'RSI'] > 70:
+        elif df.loc[i-1, 'SMA10_unscaled'] > df.loc[i-1, 'SMA50_unscaled'] and df.loc[i, 'SMA10_unscaled'] <= df.loc[i, 'SMA50_unscaled']:
+            if df.loc[i, 'RSI_unscaled'] > 70:
                 # Sell
                 shares_to_sell = math.floor(0.5 * holdings)
                 if shares_to_sell > 0:
@@ -618,7 +663,7 @@ def moving_average_crossover(df: pd.DataFrame, initial_balance: float = 100000, 
                     cost = proceeds * transaction_cost
                     holdings -= shares_to_sell
                     balance += proceeds - cost
-                    logging.debug(f"MA Crossover: Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                    logging.debug(f"[Strategy: MA Crossover] Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         net_worth = balance + holdings * df.loc[i, 'Close_unscaled']
 
     profit = net_worth - initial_balance
@@ -647,18 +692,18 @@ def macd_strategy(df: pd.DataFrame, initial_balance: float = 100000, transaction
 
     for i in range(1, len(df)):
         # MACD crossover
-        if df.loc[i-1, 'MACD'] < 0 and df.loc[i, 'MACD'] >= 0:
+        if df.loc[i-1, 'MACD_unscaled'] < 0 and df.loc[i, 'MACD_unscaled'] >= 0:
             # Buy
             atr = float(df.loc[i, 'Volatility'])  # ATR as volatility measure
             risk_per_trade = 0.01  # 1% risk per trade
             position_size = (balance * risk_per_trade) / (atr + 1e-8)  # Avoid division by zero
-            shares_to_buy = math.floor(0.5 * (max_position_size := 0.25) * balance / df.loc[i, 'Close_unscaled'])
+            shares_to_buy = math.floor(max_position_size := 0.25 * balance / df.loc[i, 'Close_unscaled'])
             if shares_to_buy > 0 and balance >= shares_to_buy * df.loc[i, 'Close_unscaled']:
                 cost = shares_to_buy * df.loc[i, 'Close_unscaled'] * transaction_cost
                 holdings += shares_to_buy
                 balance -= shares_to_buy * df.loc[i, 'Close_unscaled'] + cost
-                logging.debug(f"MACD Strategy: Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
-        elif df.loc[i-1, 'MACD'] > 0 and df.loc[i, 'MACD'] <= 0:
+                logging.debug(f"[Strategy: MACD Crossover] Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+        elif df.loc[i-1, 'MACD_unscaled'] > 0 and df.loc[i, 'MACD_unscaled'] <= 0:
             # Sell
             shares_to_sell = math.floor(0.5 * holdings)
             if shares_to_sell > 0:
@@ -666,7 +711,7 @@ def macd_strategy(df: pd.DataFrame, initial_balance: float = 100000, transaction
                 cost = proceeds * transaction_cost
                 holdings -= shares_to_sell
                 balance += proceeds - cost
-                logging.debug(f"MACD Strategy: Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                logging.debug(f"[Strategy: MACD Crossover] Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         net_worth = balance + holdings * df.loc[i, 'Close_unscaled']
 
     profit = net_worth - initial_balance
@@ -699,12 +744,12 @@ def bollinger_bands_strategy(df: pd.DataFrame, initial_balance: float = 100000, 
             atr = float(df.loc[i, 'Volatility'])  # ATR as volatility measure
             risk_per_trade = 0.01  # 1% risk per trade
             position_size = (balance * risk_per_trade) / (atr + 1e-8)  # Avoid division by zero
-            shares_to_buy = math.floor(0.5 * (max_position_size := 0.25) * balance / df.loc[i, 'Close_unscaled'])
+            shares_to_buy = math.floor(max_position_size := 0.25 * balance / df.loc[i, 'Close_unscaled'])
             if shares_to_buy > 0 and balance >= shares_to_buy * df.loc[i, 'Close_unscaled']:
                 cost = shares_to_buy * df.loc[i, 'Close_unscaled'] * transaction_cost
                 holdings += shares_to_buy
                 balance -= shares_to_buy * df.loc[i, 'Close_unscaled'] + cost
-                logging.debug(f"Bollinger Bands Strategy: Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                logging.debug(f"[Strategy: Bollinger Bands] Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         # Sell when price crosses above upper band
         elif df.loc[i, 'Close_unscaled'] > df.loc[i, 'BB_Upper_unscaled']:
             shares_to_sell = math.floor(0.5 * holdings)
@@ -713,7 +758,7 @@ def bollinger_bands_strategy(df: pd.DataFrame, initial_balance: float = 100000, 
                 cost = proceeds * transaction_cost
                 holdings -= shares_to_sell
                 balance += proceeds - cost
-                logging.debug(f"Bollinger Bands Strategy: Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                logging.debug(f"[Strategy: Bollinger Bands] Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         net_worth = balance + holdings * df.loc[i, 'Close_unscaled']
 
     profit = net_worth - initial_balance
@@ -746,12 +791,12 @@ def random_strategy(df: pd.DataFrame, initial_balance: float = 100000, transacti
             atr = float(df.loc[i, 'Volatility'])  # ATR as volatility measure
             risk_per_trade = 0.01  # 1% risk per trade
             position_size = (balance * risk_per_trade) / (atr + 1e-8)  # Avoid division by zero
-            shares_to_buy = math.floor(0.5 * (max_position_size := 0.25) * balance / df.loc[i, 'Close_unscaled'])
+            shares_to_buy = math.floor(max_position_size := 0.25 * balance / df.loc[i, 'Close_unscaled'])
             if shares_to_buy > 0 and balance >= shares_to_buy * df.loc[i, 'Close_unscaled']:
                 cost = shares_to_buy * df.loc[i, 'Close_unscaled'] * transaction_cost
                 holdings += shares_to_buy
                 balance -= shares_to_buy * df.loc[i, 'Close_unscaled'] + cost
-                logging.debug(f"Random Strategy: Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                logging.debug(f"[Strategy: Random] Bought {shares_to_buy} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         elif action == 'Sell':
             shares_to_sell = math.floor(0.5 * holdings)
             if shares_to_sell > 0:
@@ -759,7 +804,7 @@ def random_strategy(df: pd.DataFrame, initial_balance: float = 100000, transacti
                 cost = proceeds * transaction_cost
                 holdings -= shares_to_sell
                 balance += proceeds - cost
-                logging.debug(f"Random Strategy: Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
+                logging.debug(f"[Strategy: Random] Sold {shares_to_sell} shares at {df.loc[i, 'Close_unscaled']:.2f} on step {i}")
         # If Hold, do nothing
         net_worth = balance + holdings * df.loc[i, 'Close_unscaled']
 
@@ -870,50 +915,133 @@ def plot_results(df: pd.DataFrame, rl_df: pd.DataFrame, ticker: str):
 
     logging.critical(f"Combined plots saved in {PLOTS_DIR}")
 
+def plot_agent_performance(rl_df: pd.DataFrame, ticker: str):
+    """
+    Plots the RL agent's performance metrics over time.
+    
+    Args:
+        rl_df (pd.DataFrame): DataFrame containing the RL agent's trading history.
+        ticker (str): Stock ticker.
+    """
+    if rl_df.empty:
+        logging.error("RL history is empty. Cannot plot agent performance.")
+        return
+    
+    plt.figure(figsize=(15, 10))
+    
+    # Plot Net Worth
+    plt.subplot(3, 1, 1)
+    plt.plot(rl_df['Step'], rl_df['Net Worth'], label='Net Worth', color='blue')
+    plt.title(f'{ticker} RL Agent Net Worth Over Time')
+    plt.xlabel('Step')
+    plt.ylabel('Net Worth ($)')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot Reward
+    plt.subplot(3, 1, 2)
+    plt.plot(rl_df['Step'], rl_df['Reward'], label='Reward', color='green')
+    plt.title('Reward Over Time')
+    plt.xlabel('Step')
+    plt.ylabel('Reward')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot Position
+    plt.subplot(3, 1, 3)
+    plt.plot(rl_df['Step'], rl_df['Position'], label='Position', color='red')
+    plt.title('Position Over Time')
+    plt.xlabel('Step')
+    plt.ylabel('Position (Shares)')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(PLOTS_DIR / f"{ticker}_agent_performance.png")
+    plt.show()
+    logging.info("Agent performance plots generated successfully.")
+
+def plot_action_distribution(rl_df: pd.DataFrame):
+    """
+    Plots the distribution of actions taken by the agent.
+    
+    Args:
+        rl_df (pd.DataFrame): DataFrame containing the RL agent's trading history.
+    """
+    if rl_df.empty:
+        logging.error("RL history is empty. Cannot plot action distribution.")
+        return
+    
+    action_counts = rl_df['Action'].value_counts().sort_index()
+    action_labels = ['Hold', 'Buy', 'Sell']
+    
+    plt.figure(figsize=(8,6))
+    plt.bar(action_labels, action_counts, color=['grey', 'green', 'red'])
+    plt.title('Action Distribution')
+    plt.xlabel('Action')
+    plt.ylabel('Count')
+    plt.show()
+    logging.info("Action distribution plot generated successfully.")
+
 ##############################################
 # Callbacks
 ##############################################
 
 class EarlyStoppingCallback(BaseCallback):
     """
-    Custom callback for implementing early stopping based on Sharpe Ratio.
-    Stops training if the Sharpe Ratio does not improve for a given number of evaluations (patience).
+    Custom callback for implementing early stopping based on Sharpe and Sortino Ratios.
+    Stops training if neither metric improves for a given number of evaluations (patience).
     """
-    def __init__(self, monitor='train/sharpe_ratio', patience=5, min_delta=1e-3, verbose=1):
+    def __init__(self, monitor_sharpe='train/sharpe_ratio_env', monitor_sortino='train/sortino_ratio_env',
+                 patience=5, min_delta=1e-3, verbose=1):
         super(EarlyStoppingCallback, self).__init__(verbose)
-        self.monitor = monitor
+        self.monitor_sharpe = monitor_sharpe
+        self.monitor_sortino = monitor_sortino
         self.patience = patience
         self.min_delta = min_delta
-        self.best_score = -np.inf
+        self.best_sharpe = -np.inf
+        self.best_sortino = -np.inf
         self.wait = 0
 
     def _on_step(self) -> bool:
-        # Retrieve the latest value of the monitored metric
-        current_score = self.logger.name_to_value.get(self.monitor, None)
-        if current_score is None:
+        # Retrieve the latest values of the monitored metrics
+        current_sharpe = self.logger.name_to_value.get(self.monitor_sharpe, None)
+        current_sortino = self.logger.name_to_value.get(self.monitor_sortino, None)
+
+        if current_sharpe is None or current_sortino is None:
             if self.verbose > 0:
-                print(f"EarlyStoppingCallback: Metric '{self.monitor}' not found in logger.")
+                print(f"EarlyStoppingCallback: Metrics '{self.monitor_sharpe}' or '{self.monitor_sortino}' not found.")
             return True  # Continue training
 
-        if current_score > self.best_score + self.min_delta:
-            self.best_score = current_score
+        improved_sharpe = current_sharpe > self.best_sharpe + self.min_delta
+        improved_sortino = current_sortino > self.best_sortino + self.min_delta
+
+        if improved_sharpe:
+            self.best_sharpe = current_sharpe
             self.wait = 0
             if self.verbose > 0:
-                print(f"EarlyStoppingCallback: {self.monitor} improved to {self.best_score:.4f}. Resetting wait counter.")
-        else:
+                print(f"EarlyStoppingCallback: Sharpe Ratio improved to {self.best_sharpe:.4f}. Resetting wait counter.")
+        if improved_sortino:
+            self.best_sortino = current_sortino
+            self.wait = 0
+            if self.verbose > 0:
+                print(f"EarlyStoppingCallback: Sortino Ratio improved to {self.best_sortino:.4f}. Resetting wait counter.")
+
+        if not (improved_sharpe or improved_sortino):
             self.wait += 1
             if self.verbose > 0:
-                print(f"EarlyStoppingCallback: {self.monitor} did not improve. Wait counter: {self.wait}/{self.patience}")
+                print(f"EarlyStoppingCallback: No improvement in Sharpe or Sortino Ratio. Wait counter: {self.wait}/{self.patience}")
             if self.wait >= self.patience:
                 if self.verbose > 0:
                     print("EarlyStoppingCallback: Patience exceeded. Stopping training.")
                 return False  # Stop training
+
         return True  # Continue training
 
 class CustomTensorboardCallback(BaseCallback):
     """
     Custom callback for logging additional metrics to TensorBoard.
-    Logs net worth, reward, Sharpe Ratio, Max Drawdown, elapsed time, and estimated remaining time.
+    Logs net worth, reward, Sharpe Ratio, Sortino Ratio, Max Drawdown, elapsed time, and estimated remaining time.
     """
     def __init__(self, verbose=0):
         super(CustomTensorboardCallback, self).__init__(verbose)
@@ -925,40 +1053,49 @@ class CustomTensorboardCallback(BaseCallback):
     def _on_step(self) -> bool:
         # Access the environment
         env = self.training_env.envs[0]
-        
+
         # Log net worth and reward if history is not empty
         if env.history:
             last_history = env.history[-1]
-            self.logger.record("train/net_worth", last_history['Net Worth'])
-            self.logger.record("train/balance", last_history['Balance'])
-            self.logger.record("train/position", last_history['Position'])
-            self.logger.record("train/reward", last_history['Reward'])
-            self.logger.record("train/drawdown", (last_history['Net Worth'] - env.peak) / env.peak)
-            self.logger.record("train/position_size", last_history['Position'])
-            self.logger.record("train/shares_sold", env.total_shares_sold)
-            self.logger.record("train/sales_value", env.total_sales_value)
-        
-        # Calculate and log Sharpe Ratio and Max Drawdown at the end of an episode
-        if self.locals.get('done', False):
+            self.logger.record("train/net_worth_env", last_history['Net Worth'])
+            self.logger.record("train/balance_env", last_history['Balance'])
+            self.logger.record("train/position_env", last_history['Position'])
+            self.logger.record("train/reward_env", last_history['Reward'])
+            # Calculate drawdown
+            peak = max([h['Net Worth'] for h in env.history])
+            drawdown = (last_history['Net Worth'] - peak) / peak
+            self.logger.record("train/drawdown_env", drawdown)
+
+        # Calculate and log Sharpe Ratio and Sortino Ratio at the end of an episode
+        done = self.locals.get('done', False)
+        if done:
             returns = np.array([h['Reward'] for h in env.history])
             if returns.std() != 0:
                 sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(env.annual_trading_days)
-                self.logger.record("train/sharpe_ratio", sharpe_ratio)
+                self.logger.record("train/sharpe_ratio_env", sharpe_ratio)
             else:
-                self.logger.record("train/sharpe_ratio", 0.0)
-            
+                self.logger.record("train/sharpe_ratio_env", 0.0)
+
+            # Calculate Sortino Ratio
+            downside_returns = returns[returns < 0]
+            if downside_returns.size > 0:
+                sortino_ratio = (returns.mean() / (downside_returns.std() * math.sqrt(env.annual_trading_days) + 1e-8))
+            else:
+                sortino_ratio = 0.0
+            self.logger.record("train/sortino_ratio_env", sortino_ratio)
+
             # Log Maximum Drawdown
             net_worth_series = pd.Series([h['Net Worth'] for h in env.history])
             max_drawdown = calculate_max_drawdown(net_worth_series)
-            self.logger.record("train/max_drawdown", max_drawdown)
-        
+            self.logger.record("train/max_drawdown_env", max_drawdown)
+
         # Log elapsed time
         if self.start_time:
             elapsed_time = time.time() - self.start_time  # in seconds
             elapsed_time_formatted = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
-            self.logger.record("train/elapsed_time", elapsed_time)
-            self.logger.record("train/elapsed_time_formatted", elapsed_time_formatted)
-        
+            self.logger.record("train/elapsed_time_env", elapsed_time)
+            self.logger.record("train/elapsed_time_formatted_env", elapsed_time_formatted)
+
         # Estimate remaining time (simple estimation based on current step and total steps)
         total_steps = self.model.num_timesteps
         current_steps = self.model.num_timesteps
@@ -967,9 +1104,9 @@ class CustomTensorboardCallback(BaseCallback):
             if steps_remaining > 0 and elapsed_time > 0:
                 estimated_remaining_time = (elapsed_time / current_steps) * steps_remaining
                 estimated_remaining_time_formatted = time.strftime("%H:%M:%S", time.gmtime(estimated_remaining_time))
-                self.logger.record("train/remaining_time", estimated_remaining_time)
-                self.logger.record("train/remaining_time_formatted", estimated_remaining_time_formatted)
-        
+                self.logger.record("train/remaining_time_env", estimated_remaining_time)
+                self.logger.record("train/remaining_time_formatted_env", estimated_remaining_time_formatted)
+
         return True
 
 def calculate_max_drawdown(net_worth_series: pd.Series) -> float:
@@ -1016,7 +1153,7 @@ def calculate_sortino_ratio(returns: np.ndarray, periods_per_year: int = 252) ->
     target = 0.0  # Minimum acceptable return
     downside_returns = returns[returns < target]
     expected_return = returns.mean() * periods_per_year
-    downside_std = downside_returns.std() * np.sqrt(periods_per_year)
+    downside_std = downside_returns.std() * np.sqrt(periods_per_year) if len(downside_returns) > 0 else 0.0
     if downside_std == 0:
         return 0.0
     return expected_return / downside_std
@@ -1025,9 +1162,22 @@ def calculate_sortino_ratio(returns: np.ndarray, periods_per_year: int = 252) ->
 # Optuna Hyperparameter Tuning
 ##############################################
 
+def generate_unique_study_name(base_name='rl_trading_agent_study'):
+    """
+    Generates a unique study name by appending the current timestamp.
+
+    Args:
+        base_name (str): The base name for the study.
+
+    Returns:
+        str: A unique study name.
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_{timestamp}"
+
 def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_position_size, max_drawdown, annual_trading_days, transaction_cost):
     """
-    Objective function for Optuna to maximize Sharpe Ratio.
+    Objective function for Optuna to maximize Sharpe and Sortino Ratios.
 
     Args:
         trial (optuna.trial.Trial): Optuna trial object.
@@ -1042,19 +1192,26 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         transaction_cost (float): Transaction cost per trade.
 
     Returns:
-        float: Sharpe Ratio achieved by the agent.
+        float: Combined Sharpe and Sortino Ratio as the objective to maximize.
     """
     # Define hyperparameter search space
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-2)
-    n_steps = trial.suggest_categorical('n_steps', [64, 128, 256])
-    batch_size = trial.suggest_categorical('batch_size', [64, 32, 16])
+    n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
+    batch_size = trial.suggest_categorical('batch_size', [32, 64])
     gamma = trial.suggest_uniform('gamma', 0.90, 0.99)
     gae_lambda = trial.suggest_uniform('gae_lambda', 0.80, 1.00)
-    clip_range = trial.suggest_uniform('clip_range', 0.1, 0.4)
-    ent_coef = trial.suggest_loguniform('ent_coef', 1e-8, 1e-2)
-    vf_coef = trial.suggest_uniform('vf_coef', 0.1, 1.0)
-    max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.3, 0.9)
-    net_arch = trial.suggest_categorical('net_arch', ['256_256', '128_128'])
+    clip_range = trial.suggest_uniform('clip_range', 0.1, 0.3)
+    ent_coef = trial.suggest_loguniform('ent_coef', 1e-5, 1e-3)
+    vf_coef = trial.suggest_uniform('vf_coef', 0.1, 0.5)
+    max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.5, 1.0)
+    net_arch = trial.suggest_categorical('net_arch', ['128_128', '256_256'])
+
+    # Tune reward component weights (not used directly in this objective)
+    gamma_profit = trial.suggest_uniform('gamma_profit', 5, 15)
+    gamma_sharpe = trial.suggest_uniform('gamma_sharpe', 0.5, 5)
+    gamma_sortino = trial.suggest_uniform('gamma_sortino', 0.5, 5)
+    gamma_drawdown = trial.suggest_uniform('gamma_drawdown', 1, 5)
+    gamma_inactivity = trial.suggest_uniform('gamma_inactivity', 0.1, 1)
 
     # Map net_arch string to list
     if net_arch == '256_256':
@@ -1063,13 +1220,19 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         net_arch_list = [128, 128]
 
     # Initialize environment
-    env = SingleStockTradingEnv(df, scaler=scaler, initial_balance=initial_balance,
-                                stop_loss=stop_loss, take_profit=take_profit,
-                                max_position_size=max_position_size,
-                                max_drawdown=max_drawdown,
-                                annual_trading_days=annual_trading_days,
-                                transaction_cost=transaction_cost)
-    vec_env = SubprocVecEnv([lambda: env])
+    vec_env = DummyVecEnv([
+        make_env(env_params={
+            'df': df,
+            'scaler': scaler,
+            'initial_balance': initial_balance,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'max_position_size': max_position_size,
+            'max_drawdown': max_drawdown,
+            'annual_trading_days': annual_trading_days,
+            'transaction_cost': transaction_cost
+        }, env_rank=trial.number, seed=RANDOM_SEED)
+    ])
 
     # Define the policy network architecture
     policy_kwargs = dict(
@@ -1077,9 +1240,9 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         net_arch=net_arch_list
     )
 
-    # Initialize the PPO model on GPU
+    # Initialize the PPO model on CPU (since we're using MlpPolicy)
     try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = 'cpu'  # Force CPU usage for MlpPolicy
         model = PPO(
             'MlpPolicy',
             vec_env,
@@ -1098,21 +1261,25 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
             device=device
         )
     except Exception as e:
-        logging.critical(f"Model initialization failed for trial {trial.number}: {e}")
+        logging.critical(f"[Trial {trial.number}] Model initialization failed: {e}")
         return 0.0
 
-    # Train the model (shortened for tuning speed)
+    # Adjust the environment's dynamic drawdown based on trial parameters
+    env = vec_env.envs[0]
+    env.base_drawdown = max_drawdown  # Ensure base_drawdown remains consistent
+
+    # Train the model (extended training steps for better convergence)
     try:
-        model.learn(total_timesteps=20000)
+        model.learn(total_timesteps=50000)
     except Exception as e:
-        logging.critical(f"Training failed for trial {trial.number} with params {trial.params}: {e}")
+        logging.critical(f"[Trial {trial.number}] Training failed with params {trial.params}: {e}")
         return 0.0
 
     # Evaluate the trained model
     try:
         obs = vec_env.reset()
     except Exception as e:
-        logging.critical(f"Reset failed for trial {trial.number} with params {trial.params}: {e}")
+        logging.critical(f"[Trial {trial.number}] Reset failed during evaluation: {e}")
         return 0.0
 
     done = False
@@ -1124,22 +1291,58 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
             rewards.append(rewards_step[0])  # Since only one environment
             done = dones[0]
         except Exception as e:
-            logging.critical(f"Step failed for trial {trial.number} with params {trial.params}: {e}")
-            return 0.0
+            logging.critical(f"[Trial {trial.number}] Step failed during evaluation: {e}")
+            return 0.0  # Abort the trial if a step fails
 
-    # Calculate Sharpe Ratio
+    # Calculate Sharpe Ratio and Sortino Ratio
     returns = np.array(rewards)
     if returns.size == 0 or returns.std() == 0:
         sharpe_ratio = 0
+        sortino_ratio = 0
     else:
         sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(annual_trading_days)
+        downside_returns = returns[returns < 0]
+        sortino_ratio = (returns.mean() / (downside_returns.std() * math.sqrt(annual_trading_days) + 1e-8)) if len(downside_returns) > 0 else 0.0
 
-    logging.critical(f"Trial {trial.number} completed with Sharpe Ratio: {sharpe_ratio:.4f}")
-    return sharpe_ratio
+    # Combine Sharpe and Sortino Ratios for a balanced objective
+    combined_ratio = sharpe_ratio + sortino_ratio
+
+    logging.critical(f"[Trial {trial.number}] Completed with Sharpe Ratio: {sharpe_ratio:.4f}, Sortino Ratio: {sortino_ratio:.4f}")
+
+    return combined_ratio
 
 ##############################################
 # Main Execution
 ##############################################
+
+def make_env(env_params, env_rank, seed=RANDOM_SEED):
+    """
+    Creates and returns a callable that initializes the SingleStockTradingEnv.
+
+    Args:
+        env_params (dict): Parameters to initialize the environment.
+        env_rank (int): Unique identifier for the environment.
+        seed (int): Random seed.
+
+    Returns:
+        callable: A function that creates and returns a SingleStockTradingEnv instance when called.
+    """
+    def _init():
+        env_instance = SingleStockTradingEnv(
+            df=env_params['df'],
+            scaler=env_params['scaler'],
+            initial_balance=env_params['initial_balance'],
+            stop_loss=env_params['stop_loss'],
+            take_profit=env_params['take_profit'],
+            max_position_size=env_params['max_position_size'],
+            max_drawdown=env_params['max_drawdown'],
+            annual_trading_days=env_params['annual_trading_days'],
+            transaction_cost=env_params['transaction_cost'],
+            env_rank=env_rank
+        )
+        env_instance.seed(seed + env_rank)
+        return env_instance
+    return _init
 
 if __name__ == "__main__":
     # Define parameters
@@ -1188,7 +1391,8 @@ if __name__ == "__main__":
                                        max_position_size=MAX_POSITION_SIZE,
                                        max_drawdown=MAX_DRAWDOWN,
                                        annual_trading_days=ANNUAL_TRADING_DAYS,
-                                       transaction_cost=TRANSACTION_COST)
+                                       transaction_cost=TRANSACTION_COST,
+                                       env_rank=-1)  # Assign a default env_rank for the checker
     try:
         check_env(env_checker, warn=True)
         logging.info("Environment is valid!")
@@ -1202,17 +1406,21 @@ if __name__ == "__main__":
         url='sqlite:///optuna_study.db',
         engine_kwargs={'connect_args': {'check_same_thread': False}}
     )
+
+    # Generate a unique study name
+    unique_study_name = generate_unique_study_name()
+
     study = optuna.create_study(
         direction='maximize',
         sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
         storage=storage,
-        study_name='rl_trading_agent_study',
-        load_if_exists=True
+        study_name=unique_study_name,  # Unique Study Name
+        load_if_exists=False  # Ensure a new study is created
     )
     study.optimize(
         lambda trial: objective(trial, train_df, scaler, INITIAL_BALANCE, STOP_LOSS, TAKE_PROFIT,
                                MAX_POSITION_SIZE, MAX_DRAWDOWN, ANNUAL_TRADING_DAYS, TRANSACTION_COST),
-        n_trials=100,  # Increase as needed
+        n_trials=100,  # Adjust as needed
         n_jobs=-1  # Use all available CPU cores
     )
 
@@ -1224,42 +1432,12 @@ if __name__ == "__main__":
         exit()
 
     # Train final model with best hyperparameters and enable TensorBoard logging
-    if best_params.get('net_arch', '256_256') == '256_256':
+    if best_params.get('net_arch', '128_128') == '256_256':
         net_arch_list = [256, 256]
     else:
         net_arch_list = [128, 128]
 
     # Initialize environment
-    env = SingleStockTradingEnv(train_df, scaler=scaler, initial_balance=INITIAL_BALANCE,
-                                stop_loss=STOP_LOSS, take_profit=TAKE_PROFIT,
-                                max_position_size=MAX_POSITION_SIZE,
-                                max_drawdown=MAX_DRAWDOWN,
-                                annual_trading_days=ANNUAL_TRADING_DAYS,
-                                transaction_cost=TRANSACTION_COST)
-    
-    # Determine the number of CPU cores available
-    num_cpu = multiprocessing.cpu_count()
-    logging.info(f"Number of CPU cores available: {num_cpu}")
-
-    # Define a function to create environments
-    def make_env(env_id, rank, seed=RANDOM_SEED):
-        def _init():
-            env_instance = SingleStockTradingEnv(
-                df=env_id['df'],
-                scaler=env_id['scaler'],
-                initial_balance=env_id['initial_balance'],
-                stop_loss=env_id['stop_loss'],
-                take_profit=env_id['take_profit'],
-                max_position_size=env_id['max_position_size'],
-                max_drawdown=env_id['max_drawdown'],
-                annual_trading_days=env_id['annual_trading_days'],
-                transaction_cost=env_id['transaction_cost']
-            )
-            env_instance.seed(seed + rank)
-            return env_instance
-        return _init
-
-    # Prepare environment parameters
     env_params = {
         'df': train_df,
         'scaler': scaler,
@@ -1272,10 +1450,14 @@ if __name__ == "__main__":
         'transaction_cost': TRANSACTION_COST
     }
 
-    # Create a list of environment initializers
-    env_list = [make_env(env_params, i) for i in range(num_cpu)]
+    # Determine the number of CPU cores available
+    num_cpu = multiprocessing.cpu_count()
+    logging.info(f"Number of CPU cores available: {num_cpu}")
 
-    # Initialize SubprocVecEnv with the list of environments
+    # Create a list of environment initializers with unique ranks
+    env_list = [make_env(env_params, i, RANDOM_SEED) for i in range(num_cpu)]
+
+    # Initialize SubprocVecEnv with the list of callable environments
     vec_env = SubprocVecEnv(env_list)
 
     logging.info(f"Initialized SubprocVecEnv with {num_cpu} parallel environments.")
@@ -1286,9 +1468,9 @@ if __name__ == "__main__":
         net_arch=net_arch_list
     )
 
-    # Initialize PPO model with best hyperparameters and enable GPU usage
+    # Initialize PPO model with best hyperparameters and enable CPU usage
     try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        device = 'cpu'  # Force CPU usage for MlpPolicy
         model = PPO(
             'MlpPolicy',
             vec_env,
@@ -1301,11 +1483,11 @@ if __name__ == "__main__":
             gamma=best_params.get('gamma', 0.99),
             gae_lambda=best_params.get('gae_lambda', 0.95),
             clip_range=best_params.get('clip_range', 0.2),
-            ent_coef=best_params.get('ent_coef', 1e-3),
+            ent_coef=best_params.get('ent_coef', 0.01),  # Increased entropy coefficient
             vf_coef=best_params.get('vf_coef', 0.5),
             max_grad_norm=best_params.get('max_grad_norm', 0.5),
             tensorboard_log=str(TB_LOG_DIR),
-            device=device  # Use GPU if available
+            device=device  # Use CPU
         )
     except Exception as e:
         logging.critical(f"Model initialization failed: {e}")
@@ -1319,7 +1501,8 @@ if __name__ == "__main__":
     )
     custom_callback = CustomTensorboardCallback()
     early_stopping_callback = EarlyStoppingCallback(
-        monitor='train/sharpe_ratio',
+        monitor_sharpe='train/sharpe_ratio_env',
+        monitor_sortino='train/sortino_ratio_env',
         patience=5,  # Number of evaluations with no improvement
         min_delta=1e-3,  # Minimum improvement to reset patience
         verbose=1
@@ -1332,7 +1515,7 @@ if __name__ == "__main__":
     logging.info("Starting training of PPO agent with Early Stopping...")
     try:
         model.learn(
-            total_timesteps=50000,
+            total_timesteps=50000,  # Extended training steps for better convergence
             callback=callback_list
         )
     except Exception as e:
@@ -1349,8 +1532,19 @@ if __name__ == "__main__":
                                      max_position_size=MAX_POSITION_SIZE,
                                      max_drawdown=MAX_DRAWDOWN,
                                      annual_trading_days=ANNUAL_TRADING_DAYS,
-                                     transaction_cost=TRANSACTION_COST)
-    test_vec_env = SubprocVecEnv([lambda: test_env])
+                                     transaction_cost=TRANSACTION_COST,
+                                     env_rank=999)  # Assign a unique env_rank for testing
+    test_vec_env = DummyVecEnv([make_env(env_params={
+        'df': test_df,
+        'scaler': scaler,
+        'initial_balance': INITIAL_BALANCE,
+        'stop_loss': STOP_LOSS,
+        'take_profit': TAKE_PROFIT,
+        'max_position_size': MAX_POSITION_SIZE,
+        'max_drawdown': MAX_DRAWDOWN,
+        'annual_trading_days': ANNUAL_TRADING_DAYS,
+        'transaction_cost': TRANSACTION_COST
+    }, env_rank=999, seed=RANDOM_SEED)])
 
     try:
         obs = test_vec_env.reset()
@@ -1364,7 +1558,7 @@ if __name__ == "__main__":
             action, _ = model.predict(obs, deterministic=True)
             obs, rewards_step, dones, infos = test_vec_env.step(action)
             done = dones[0]
-            logging.debug(f"Test Step: Action Taken = {action}, Reward = {rewards_step[0]}")
+            logging.debug(f"[Test Env {test_env.env_rank}] Step: Action Taken = {action}, Reward = {rewards_step[0]}")
         except Exception as e:
             logging.critical(f"Step failed during testing: {e}")
             break
@@ -1381,20 +1575,22 @@ if __name__ == "__main__":
     returns = np.array(rl_df['Reward'])
     if returns.size == 0 or returns.std() == 0:
         rl_sharpe_ratio = 0
+        rl_sortino_ratio = 0
     else:
         rl_sharpe_ratio = (returns.mean() / returns.std()) * math.sqrt(ANNUAL_TRADING_DAYS)
+        downside_returns = returns[returns < 0]
+        rl_sortino_ratio = (returns.mean() / (downside_returns.std() * math.sqrt(ANNUAL_TRADING_DAYS) + 1e-8)) if len(downside_returns) > 0 else 0.0
+
     if not rl_df.empty:
         rl_final_net_worth = rl_df['Net Worth'].iloc[-1]
         rl_profit = rl_final_net_worth - INITIAL_BALANCE
         rl_max_dd = calculate_max_drawdown(rl_df['Net Worth'])
         rl_annualized_return = calculate_annualized_return(rl_df['Net Worth'])
-        rl_sortino_ratio = calculate_sortino_ratio(returns, ANNUAL_TRADING_DAYS)
     else:
         rl_final_net_worth = INITIAL_BALANCE
         rl_profit = 0
         rl_max_dd = 0
         rl_annualized_return = 0
-        rl_sortino_ratio = 0
 
     # Evaluate Baseline Strategies on Test Data
     logging.info("Evaluating Baseline Strategies on Test Data...")
@@ -1430,8 +1626,32 @@ if __name__ == "__main__":
     # Plot Trading Results
     plot_results(test_df, rl_df, TICKER)
 
+    # Plot Agent's Performance Metrics
+    plot_agent_performance(rl_df, TICKER)
+
+    # Plot Action Distribution
+    plot_action_distribution(rl_df)
+
     # Instructions for TensorBoard
     logging.critical("Training logs are stored for TensorBoard.")
     logging.critical("To view them, run the following command in your terminal:")
     logging.critical(f"tensorboard --logdir {TB_LOG_DIR}")
     logging.critical("Then open http://localhost:6006 in your browser to visualize the training metrics.")
+
+    # Optional: Visualize Optuna study results
+    try:
+        import optuna.visualization as vis
+
+        # Plot optimization history
+        fig1 = vis.plot_optimization_history(study)
+        fig1.savefig(PLOTS_DIR / "optuna_optimization_history.png")
+        fig1.show()
+
+        # Plot parameter importances
+        fig2 = vis.plot_param_importances(study)
+        fig2.savefig(PLOTS_DIR / "optuna_param_importances.png")
+        fig2.show()
+    except ImportError:
+        logging.warning("Optuna visualization module not found. Install it via pip if you wish to visualize study results.")
+
+    logging.info("Script execution completed successfully.")
