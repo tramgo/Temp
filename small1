@@ -136,11 +136,11 @@ def check_versions():
     main_logger.debug(f"Gymnasium version: {gymnasium_version}")
     main_logger.debug(f"Optuna version: {optuna_version}")
 
-    # Ensure SB3 is at least version 1.4.0
+    # Ensure SB3 is at least version 2.0.0 for Gymnasium support
     try:
         sb3_major, sb3_minor, sb3_patch = map(int, sb3_version.split('.')[:3])
-        if sb3_major < 1 or (sb3_major == 1 and sb3_minor < 4):
-            main_logger.error("Stable Baselines3 version must be at least 1.4.0. Please upgrade SB3.")
+        if sb3_major < 2:
+            main_logger.error("Stable Baselines3 version must be at least 2.0.0. Please upgrade SB3.")
             exit()
     except:
         main_logger.error("Unable to parse Stable Baselines3 version. Please ensure it's installed correctly.")
@@ -432,6 +432,7 @@ class SingleStockTradingEnv(gym.Env):
             - truncated (bool): Whether the episode was truncated.
             - info (dict): Additional information.
         """
+        training_logger.debug(f"[Env {self.env_rank}] step() called at current_step={self.current_step} with action={action}")
         try:
             # Validate action
             action_value = float(action[0])
@@ -509,6 +510,7 @@ class SingleStockTradingEnv(gym.Env):
                 self.transaction_count += 1
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
             else:
+                # Either can't sell or shares_to_sell is 0; no trade occurs
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough shares to sell or shares_to_sell=0.")
 
         else:
@@ -535,7 +537,7 @@ class SingleStockTradingEnv(gym.Env):
 
         # Penalty for high drawdown
         self.peak = max(self.peak, self.net_worth)
-        current_drawdown = (self.peak - self.net_worth) / self.peak
+        current_drawdown = (self.peak - self.net_worth) / self.peak if self.peak > 0 else 0.0
         if current_drawdown > self.max_drawdown:
             drawdown_penalty = -0.01  # Significant penalty
         else:
@@ -1256,7 +1258,8 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     """
     Objective function for Optuna to maximize final performance metric based on final net worth.
 
-    Instead of summing step-by-step rewards, this version focuses on final net worth.
+    This version logs all individual properties of the environment at the end of each trial
+    for comprehensive debugging and analysis.
     """
     # Define hyperparameter search space    
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-2)
@@ -1281,7 +1284,7 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         max_drawdown=max_drawdown,
         annual_trading_days=annual_trading_days,
         transaction_cost=transaction_cost,
-        env_rank=trial.number + 1,
+        env_rank=trial.number + 1,  # Unique identifier for the environment
         reward_weights={'gamma': 1.0}  # Simplified reward weights
     )
     env.seed(RANDOM_SEED + trial.number + 1)
@@ -1354,7 +1357,7 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
 
     done = False
     steps_taken = 0
-    while not done:
+    while not done and steps_taken < 1000:  # Prevent infinite loops
         try:
             action, _ = model.predict(obs, deterministic=True)
             obs, rewards_step, dones, infos = vec_env.step(action)
@@ -1364,15 +1367,34 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
             main_logger.critical(f"[Trial {trial.number}] Step failed during evaluation: {e}")
             break
 
-    # Now that the evaluation episode ended, access the final net worth
-    # env is inside vec_env: vec_env.envs[0] is our environment instance
+    # Now that the evaluation episode ended, access the final net worth and other properties
     eval_env = vec_env.envs[0]
     final_net_worth = eval_env.net_worth
+    final_balance = eval_env.balance
+    final_position = eval_env.position
+    final_transaction_count = eval_env.transaction_count
+    final_peak = eval_env.peak
+    final_drawdown = (final_peak - final_net_worth) / final_peak if final_peak > 0 else 0.0
 
-    # Calculate metric as final net worth relative to initial balance
+    # Calculate combined ratio
     combined_ratio = (final_net_worth - initial_balance) / initial_balance
 
+    # Log all individual properties
     main_logger.critical(f"[Trial {trial.number}] Combined Ratio: {combined_ratio:.4f}")
+    main_logger.critical(f"[Trial {trial.number}] Final Net Worth: ${final_net_worth:.2f}")
+    main_logger.critical(f"[Trial {trial.number}] Final Balance: ${final_balance:.2f}")
+    main_logger.critical(f"[Trial {trial.number}] Final Position: {final_position} shares")
+    main_logger.critical(f"[Trial {trial.number}] Total Transactions: {final_transaction_count}")
+    main_logger.critical(f"[Trial {trial.number}] Final Peak Net Worth: ${final_peak:.2f}")
+    main_logger.critical(f"[Trial {trial.number}] Final Drawdown: {final_drawdown*100:.2f}%")
+
+    # Optionally, log additional properties from the history
+    if hasattr(eval_env, 'history') and eval_env.history:
+        last_history = eval_env.history[-1]
+        history_details = "\n".join([f"{key}: {value}" for key, value in last_history.items()])
+        main_logger.critical(f"[Trial {trial.number}] Last Step History:\n{history_details}")
+    else:
+        main_logger.warning(f"[Trial {trial.number}] Environment history is empty or not available.")
 
     return combined_ratio
 
@@ -1681,7 +1703,7 @@ if __name__ == "__main__":
 
     done = False
     steps_taken = 0
-    while not done:
+    while not done and steps_taken < 1000:  # Prevent infinite loops
         try:
             action, _ = model.predict(obs, deterministic=True)
             obs, rewards_step, dones, infos = test_vec_env.step(action)
@@ -1747,7 +1769,7 @@ if __name__ == "__main__":
     main_logger.critical(f"  Final Net Worth: ${rl_final_net_worth:.2f}")
     main_logger.critical(f"  Profit: ${rl_profit:.2f}")
     main_logger.critical(f"  Annualized Return: {rl_annualized_return*100:.2f}%")
-    main_logger.critical(f"  Max Drawdown: {rl_max_dd:.2f}")
+    main_logger.critical(f"  Max Drawdown: {rl_max_dd:.2f}%")
 
     # Plot RL Training History
     plot_rl_training_history(rl_df)
