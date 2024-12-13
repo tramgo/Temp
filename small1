@@ -3,8 +3,6 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
-import yfinance as yf
-from ta import trend, momentum, volatility, volume
 import matplotlib.pyplot as plt
 import seaborn as sns
 from stable_baselines3 import PPO
@@ -153,90 +151,91 @@ def check_versions():
 check_versions()
 
 ##############################################
-# Fetch and Prepare Data
+# Synthetic Data Generation
 ##############################################
 
-def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[StandardScaler] = None, fit_scaler: bool = False) -> Tuple[pd.DataFrame, Optional[StandardScaler]]:
+def generate_synthetic_data(num_days: int = 1000,
+                            start_price: float = 100.0,
+                            mu: float = 0.0002,
+                            sigma: float = 0.01,
+                            seed: int = RANDOM_SEED) -> pd.DataFrame:
     """
-    Fetches historical stock data from Yahoo Finance, calculates technical indicators,
-    and performs scaling on the features.
+    Generates synthetic stock price data using geometric Brownian motion.
 
     Args:
-        ticker (str): Stock ticker symbol.
-        start_date (str): Start date in 'YYYY-MM-DD' format.
-        end_date (str): End date in 'YYYY-MM-DD' format.
-        scaler (Optional[StandardScaler], optional): Scaler object. Defaults to None.
-        fit_scaler (bool, optional): Whether to fit the scaler on the data. Defaults to False.
+        num_days (int, optional): Number of trading days to simulate. Defaults to 1000.
+        start_price (float, optional): Starting price of the stock. Defaults to 100.0.
+        mu (float, optional): Drift coefficient. Defaults to 0.0002.
+        sigma (float, optional): Volatility coefficient. Defaults to 0.01.
+        seed (int, optional): Random seed for reproducibility. Defaults to RANDOM_SEED.
 
     Returns:
-        Tuple[pd.DataFrame, Optional[StandardScaler]]: Processed DataFrame with technical indicators and scaled features, and the scaler.
+        pd.DataFrame: DataFrame containing synthetic stock data with technical indicators.
     """
-    main_logger.info(f"Fetching data for {ticker} from {start_date} to {end_date}")
-    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-    if df.empty:
-        main_logger.error(f"No data fetched for {ticker}")
-        return df, scaler
+    np.random.seed(seed)
+    random.seed(seed)
 
-    required_columns = ['Close', 'High', 'Low', 'Volume']
-    for col in required_columns:
-        if col not in df.columns:
-            main_logger.error(f"{col} not in downloaded data for {ticker}.")
-            return pd.DataFrame(), scaler
+    # Generate date range
+    dates = pd.bdate_range(end=datetime.datetime.today(), periods=num_days)
+    dt = 1/252  # One trading day
 
-    if len(df) < 200:
-        main_logger.error(f"Not enough data points for {ticker}.")
-        return pd.DataFrame(), scaler
+    # Geometric Brownian Motion
+    price = [start_price]
+    for _ in range(1, num_days):
+        drift = (mu - 0.5 * sigma**2) * dt
+        shock = sigma * np.random.normal() * np.sqrt(dt)
+        price.append(price[-1] * np.exp(drift + shock))
+    df = pd.DataFrame({'Date': dates, 'Close': price})
 
-    close_col = 'Close'
+    # Generate High and Low prices based on Close price
+    df['High'] = df['Close'] * (1 + np.random.uniform(0.001, 0.02, size=num_days))
+    df['Low'] = df['Close'] * (1 - np.random.uniform(0.001, 0.02, size=num_days))
+
+    # Generate Volume
+    df['Volume'] = np.random.randint(1000, 10000, size=num_days)
+
+    # Calculate Technical Indicators using the 'ta' library
     try:
-        close = df[close_col].squeeze()
-        high = df['High'].squeeze()
-        low = df['Low'].squeeze()
-        volume_col = df['Volume'].squeeze()
+        import ta
+        close = df['Close']
+        high = df['High']
+        low = df['Low']
+        volume_col = df['Volume']
 
-        # Calculate technical indicators
-        sma10 = trend.SMAIndicator(close=close, window=10).sma_indicator()
-        sma50 = trend.SMAIndicator(close=close, window=50).sma_indicator()
-        rsi = momentum.RSIIndicator(close=close, window=14).rsi()
-        macd = trend.MACD(close=close).macd()
-        adx = trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
-        bollinger = volatility.BollingerBands(close=close, window=20, window_dev=2)
-        bb_upper = bollinger.bollinger_hband()
-        bb_lower = bollinger.bollinger_lband()
-        bollinger_width = bollinger.bollinger_wband()
-        ema20 = trend.EMAIndicator(close=close, window=20).ema_indicator()
-        vwap = volume.VolumeWeightedAveragePrice(high=high, low=low, close=close, volume=volume_col, window=14).volume_weighted_average_price()
-        lagged_return = close.pct_change().fillna(0)
-        atr = volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+        # Simple Moving Averages
+        df['SMA10'] = ta.trend.SMAIndicator(close=close, window=10).sma_indicator()
+        df['SMA50'] = ta.trend.SMAIndicator(close=close, window=50).sma_indicator()
 
-        # Verify that all indicators were calculated successfully
-        indicators = {
-            'SMA10': sma10,
-            'SMA50': sma50,
-            'RSI': rsi,
-            'MACD': macd,
-            'ADX': adx,
-            'BB_Upper': bb_upper,
-            'BB_Lower': bb_lower,
-            'Bollinger_Width': bollinger_width,
-            'EMA20': ema20,
-            'VWAP': vwap,
-            'Lagged_Return': lagged_return,
-            'Volatility': atr
-        }
+        # RSI
+        df['RSI'] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
 
-        for key, value in indicators.items():
-            if value.isnull().all():
-                main_logger.error(f"Technical indicator {key} could not be calculated properly.")
-                return pd.DataFrame(), scaler
+        # MACD
+        df['MACD'] = ta.trend.MACD(close=close).macd()
+
+        # ADX
+        df['ADX'] = ta.trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
+
+        # Bollinger Bands
+        bollinger = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
+        df['BB_Upper'] = bollinger.bollinger_hband()
+        df['BB_Lower'] = bollinger.bollinger_lband()
+        df['Bollinger_Width'] = bollinger.bollinger_wband()
+
+        # EMA20
+        df['EMA20'] = ta.trend.EMAIndicator(close=close, window=20).ema_indicator()
+
+        # VWAP
+        df['VWAP'] = ta.volume.VolumeWeightedAveragePrice(high=high, low=low, close=close, volume=volume_col, window=14).volume_weighted_average_price()
+
+        # Lagged Return
+        df['Lagged_Return'] = close.pct_change().fillna(0)
+
+        # Volatility (ATR)
+        df['Volatility'] = ta.volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
 
     except Exception as e:
-        main_logger.error(f"Error calculating indicators for {ticker}: {e}")
-        return pd.DataFrame(), scaler
-
-    # Append indicators to DataFrame
-    for key, value in indicators.items():
-        df[key] = value
+        main_logger.error(f"Error calculating technical indicators: {e}")
+        return pd.DataFrame()
 
     # Add unscaled versions of relevant features
     for feature in FEATURES_TO_SCALE:
@@ -245,34 +244,21 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
             main_logger.debug(f"Added column: {feature}_unscaled")
         else:
             main_logger.error(f"Feature {feature} is missing from DataFrame. Cannot create {feature}_unscaled.")
-            return pd.DataFrame(), scaler
+            return pd.DataFrame()
 
     # Handle missing values
     df.fillna(method='ffill', inplace=True)
     df.fillna(0, inplace=True)
-    df.reset_index(inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
     # Data Validation: Check for columns filled with zeros
-    zero_filled_columns = df[required_columns].columns[(df[required_columns] == 0).all()].tolist()
+    zero_filled_columns = df[UNSCALED_FEATURES].columns[(df[UNSCALED_FEATURES] == 0).all()].tolist()
     if zero_filled_columns:
         main_logger.error(f"One or more required columns are entirely filled with zeros: {zero_filled_columns}. Aborting data processing.")
-        return pd.DataFrame(), scaler
+        return pd.DataFrame()
 
-    main_logger.info(f"Data for {ticker} fetched and processed successfully.")
-
-    # Scaling Features
-    if fit_scaler:
-        scaler = StandardScaler()
-        df[FEATURES_TO_SCALE] = scaler.fit_transform(df[FEATURES_TO_SCALE])
-        main_logger.debug("Features scaled and scaler fitted.")
-    elif scaler is not None:
-        df[FEATURES_TO_SCALE] = scaler.transform(df[FEATURES_TO_SCALE])
-        main_logger.debug("Features scaled using existing scaler.")
-    else:
-        main_logger.error("Scaler not provided for scaling. Returning unscaled data.")
-        return df, scaler
-
-    return df, scaler
+    main_logger.info("Synthetic data generated and processed successfully.")
+    return df
 
 ##############################################
 # Custom Trading Environment
@@ -1434,8 +1420,8 @@ def make_env(env_params, env_rank, seed=RANDOM_SEED):
 
 if __name__ == "__main__":
     # Define parameters
-    TICKER = 'APOLLOTYRE.NS'
-    START_DATE = '2018-01-01'
+    TICKER = 'SYNTHETIC'  # Renamed ticker for synthetic data
+    START_DATE = '2010-01-01'
     END_DATE = datetime.datetime.now().strftime('%Y-%m-%d')  # Current date
     INITIAL_BALANCE = 100000
     STOP_LOSS = 0.90
@@ -1445,11 +1431,19 @@ if __name__ == "__main__":
     ANNUAL_TRADING_DAYS = 252
     TRANSACTION_COST = 0.001  # 0.1% per trade
 
-    # Fetch and prepare data
-    # Scaling is now handled within get_data
-    df, scaler = get_data(TICKER, START_DATE, END_DATE, scaler=None, fit_scaler=True)
+    # Generate and prepare synthetic data
+    df = generate_synthetic_data(num_days=1500, start_price=100.0, mu=0.0002, sigma=0.01, seed=RANDOM_SEED)
     if df.empty:
-        main_logger.critical("No data fetched. Exiting.")
+        main_logger.critical("Synthetic data generation failed. Exiting.")
+        exit()
+
+    # Initialize scaler
+    scaler = StandardScaler()
+    try:
+        df[FEATURES_TO_SCALE] = scaler.fit_transform(df[FEATURES_TO_SCALE])
+        main_logger.debug("Features scaled and scaler fitted.")
+    except Exception as e:
+        main_logger.error(f"Error during feature scaling: {e}")
         exit()
 
     # Split into training and testing datasets
@@ -1769,7 +1763,7 @@ if __name__ == "__main__":
     main_logger.critical(f"  Final Net Worth: ${rl_final_net_worth:.2f}")
     main_logger.critical(f"  Profit: ${rl_profit:.2f}")
     main_logger.critical(f"  Annualized Return: {rl_annualized_return*100:.2f}%")
-    main_logger.critical(f"  Max Drawdown: {rl_max_dd:.2f}%")
+    main_logger.critical(f"  Max Drawdown: {rl_max_dd*100:.2f}%")
 
     # Plot RL Training History
     plot_rl_training_history(rl_df)
