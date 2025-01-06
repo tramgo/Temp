@@ -3,7 +3,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
-import yfinance as yf
+# Removed yfinance import
 from ta import trend, momentum, volatility, volume
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -31,7 +31,6 @@ try:
     from concurrent_log_handler import ConcurrentRotatingFileHandler
 except ImportError:
     raise ImportError("Please install 'concurrent-log-handler' package via pip: pip install concurrent-log-handler")
-
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -117,7 +116,6 @@ def log_phase(phase: str, status: str = "Starting", env_details: dict = None, du
 
 # Configure Logging for Main Logger
 main_logger.info("Logging has been configured with separate loggers for main, training, testing, and phases.")
-
 ##############################################
 # Version Checks
 ##############################################
@@ -153,67 +151,65 @@ def check_versions():
         main_logger.warning("Consider upgrading Gymnasium to the latest version for better compatibility.")
 
 check_versions()
-
 ##############################################
 # Fetch and Prepare Data
 ##############################################
 
-def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[StandardScaler] = None, fit_scaler: bool = False) -> Tuple[pd.DataFrame, Optional[StandardScaler]]:
+def get_data(csv_file_path: str, scaler: Optional[StandardScaler] = None, fit_scaler: bool = False) -> Tuple[pd.DataFrame, Optional[StandardScaler]]:
     """
-    Fetches historical stock data from Yahoo Finance, calculates technical indicators,
+    Reads historical stock data from a CSV file, calculates technical indicators,
     and performs scaling on the features.
 
     Args:
-        ticker (str): Stock ticker symbol.
-        start_date (str): Start date in 'YYYY-MM-DD' format.
-        end_date (str): End date in 'YYYY-MM-DD' format.
+        csv_file_path (str): Path to the CSV file containing stock data.
         scaler (Optional[StandardScaler], optional): Scaler object. Defaults to None.
         fit_scaler (bool, optional): Whether to fit the scaler on the data. Defaults to False.
 
     Returns:
         Tuple[pd.DataFrame, Optional[StandardScaler]]: Processed DataFrame with technical indicators and scaled features, and the scaler.
     """
-    main_logger.info(f"Fetching data for {ticker} from {start_date} to {end_date}")
-    
-    # Initial Cleanup: Fetch simple data
-    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+    main_logger.info(f"Reading data from CSV file at {csv_file_path}")
+
+    # Read data from CSV
+    try:
+        df = pd.read_csv(csv_file_path)
+    except FileNotFoundError:
+        main_logger.error(f"CSV file not found at {csv_file_path}")
+        return pd.DataFrame(), scaler
+    except Exception as e:
+        main_logger.error(f"Error reading CSV file: {e}")
+        return pd.DataFrame(), scaler
+
     if df.empty:
-        main_logger.error(f"No data fetched for {ticker}")
+        main_logger.error(f"No data found in CSV file at {csv_file_path}")
         # Save empty DataFrame to CSV
-        empty_file = RESULTS_DIR / f"{ticker}_data_fetched.csv"
+        empty_file = RESULTS_DIR / "data_fetched_empty.csv"
         df.to_csv(empty_file, index=True)
         main_logger.info(f"Empty fetched data saved to {empty_file}")
         return df, scaler
 
-    # Check if columns are MultiIndex and flatten them
-    if isinstance(df.columns, pd.MultiIndex):
-        if df.columns.nlevels == 2 and df.columns.get_level_values(1).unique().size == 1:
-            # Flatten columns by taking the first level if second level has only one unique value
-            df.columns = df.columns.get_level_values(0)
-            main_logger.debug("Flattened MultiIndex columns to single level.")
-        else:
-            main_logger.error("DataFrame has MultiIndex columns with multiple tickers. Please adjust the data fetching.")
-            # Save DataFrame with MultiIndex columns
-            multiindex_file = RESULTS_DIR / f"{ticker}_data_multiindex_columns.csv"
-            df.to_csv(multiindex_file, index=True)
-            main_logger.info(f"Data with MultiIndex columns saved to {multiindex_file}")
-            return pd.DataFrame(), scaler
-
-    # Ensure the Date index is converted to a column and parse dates
-    df.reset_index(inplace=True)
-    df['Date'] = pd.to_datetime(df['Date'])
-    # Select specific columns and ensure they are of the correct type
-    try:
-        df = df[['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']]
-    except KeyError as e:
-        main_logger.error(f"Missing required columns in fetched data: {e}")
-        error_file = RESULTS_DIR / f"{ticker}_data_error_missing_columns.csv"
-        df.to_csv(error_file, index=True)
-        main_logger.info(f"Data with missing columns saved to {error_file}")
+    # Ensure the Date column is parsed correctly
+    if 'Date' not in df.columns:
+        main_logger.error("CSV file must contain a 'Date' column.")
         return pd.DataFrame(), scaler
 
-    # Save fetched data immediately after fetching
-    fetched_data_file = RESULTS_DIR / f"{ticker}_data_fetched.csv"
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.sort_values('Date', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Select specific columns and ensure they are of the correct type
+    required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+    for col in required_columns:
+        if col not in df.columns:
+            main_logger.error(f"Missing required column '{col}' in CSV file.")
+            # Save DataFrame with missing columns
+            error_file = RESULTS_DIR / f"data_error_missing_column_{col}.csv"
+            df.to_csv(error_file, index=True)
+            main_logger.info(f"Data with missing column {col} saved to {error_file}")
+            return pd.DataFrame(), scaler
+
+    # Save fetched data immediately after reading
+    fetched_data_file = RESULTS_DIR / "data_fetched.csv"
     df.to_csv(fetched_data_file, index=True)
     main_logger.info(f"Fetched data saved to {fetched_data_file}")
 
@@ -221,22 +217,11 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
     numeric_cols = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
-    # Select relevant columns
-    required_columns = ['Close', 'High', 'Low', 'Volume']
-    for col in required_columns:
-        if col not in df.columns:
-            main_logger.error(f"{col} not in downloaded data for {ticker}.")
-            # Save DataFrame with missing columns
-            error_file = RESULTS_DIR / f"{ticker}_data_error_missing_columns.csv"
-            df.to_csv(error_file, index=True)
-            main_logger.info(f"Data with missing columns saved to {error_file}")
-            return pd.DataFrame(), scaler
-
     # Check for sufficient data
     if len(df) < 200:
-        main_logger.error(f"Not enough data points for {ticker}.")
+        main_logger.error("Not enough data points in CSV file.")
         # Save insufficient data DataFrame
-        insufficient_file = RESULTS_DIR / f"{ticker}_data_insufficient.csv"
+        insufficient_file = RESULTS_DIR / "data_insufficient.csv"
         df.to_csv(insufficient_file, index=True)
         main_logger.info(f"Insufficient data saved to {insufficient_file}")
         return pd.DataFrame(), scaler
@@ -283,15 +268,15 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
             if value.isnull().all():
                 main_logger.error(f"Technical indicator {key} could not be calculated properly.")
                 # Save DataFrame with failed indicator
-                failed_indicator_file = RESULTS_DIR / f"{ticker}_data_failed_indicator_{key}.csv"
+                failed_indicator_file = RESULTS_DIR / f"data_failed_indicator_{key}.csv"
                 df.to_csv(failed_indicator_file, index=True)
                 main_logger.info(f"Data with failed indicator {key} saved to {failed_indicator_file}")
                 return pd.DataFrame(), scaler
 
     except Exception as e:
-        main_logger.error(f"Error calculating indicators for {ticker}: {e}")
+        main_logger.error(f"Error calculating indicators: {e}")
         # Save DataFrame with error
-        error_calculation_file = RESULTS_DIR / f"{ticker}_data_error_calculation.csv"
+        error_calculation_file = RESULTS_DIR / "data_error_calculation.csv"
         df.to_csv(error_calculation_file, index=True)
         main_logger.info(f"Data with calculation error saved to {error_calculation_file}")
         return pd.DataFrame(), scaler
@@ -301,7 +286,7 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
         df[key] = value
 
     # Save DataFrame after adding indicators (before scaling)
-    df_before_scaling_file = RESULTS_DIR / f"{ticker}_data_before_scaling.csv"
+    df_before_scaling_file = RESULTS_DIR / "data_before_scaling.csv"
     df.to_csv(df_before_scaling_file, index=True)
     main_logger.info(f"Data with indicators saved before scaling to {df_before_scaling_file}")
 
@@ -313,13 +298,13 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
         else:
             main_logger.error(f"Feature {feature} is missing from DataFrame. Cannot create {feature}_unscaled.")
             # Save DataFrame with missing feature
-            missing_feature_file = RESULTS_DIR / f"{ticker}_data_missing_feature_{feature}.csv"
+            missing_feature_file = RESULTS_DIR / f"data_missing_feature_{feature}.csv"
             df.to_csv(missing_feature_file, index=True)
             main_logger.info(f"Data with missing feature {feature} saved to {missing_feature_file}")
             return pd.DataFrame(), scaler
 
     # Save DataFrame after adding unscaled columns
-    df_after_unscaled_file = RESULTS_DIR / f"{ticker}_data_after_unscaled.csv"
+    df_after_unscaled_file = RESULTS_DIR / "data_after_unscaled.csv"
     df.to_csv(df_after_unscaled_file, index=True)
     main_logger.info(f"Data with unscaled features saved to {df_after_unscaled_file}")
 
@@ -333,12 +318,12 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
     if zero_filled_columns:
         main_logger.error(f"One or more required columns are entirely filled with zeros: {zero_filled_columns}. Aborting data processing.")
         # Save DataFrame with zero-filled columns
-        zero_filled_file = RESULTS_DIR / f"{ticker}_data_zero_filled_columns.csv"
+        zero_filled_file = RESULTS_DIR / "data_zero_filled_columns.csv"
         df.to_csv(zero_filled_file, index=True)
         main_logger.info(f"Data with zero-filled columns saved to {zero_filled_file}")
         return pd.DataFrame(), scaler
 
-    main_logger.info(f"Data for {ticker} fetched and processed successfully.")
+    main_logger.info("Data fetched and processed successfully from CSV.")
 
     # Scaling Features
     if fit_scaler:
@@ -351,18 +336,17 @@ def get_data(ticker: str, start_date: str, end_date: str, scaler: Optional[Stand
     else:
         main_logger.error("Scaler not provided for scaling. Returning unscaled data.")
         # Save unscaled DataFrame
-        unscaled_file = RESULTS_DIR / f"{ticker}_data_unscaled_final.csv"
+        unscaled_file = RESULTS_DIR / "data_unscaled_final.csv"
         df.to_csv(unscaled_file, index=True)
         main_logger.info(f"Unscaled data saved to {unscaled_file}")
         return df, scaler
 
     # Save DataFrame after scaling
-    df_scaled_file = RESULTS_DIR / f"{ticker}_data_scaled.csv"
+    df_scaled_file = RESULTS_DIR / "data_scaled.csv"
     df.to_csv(df_scaled_file, index=True)
     main_logger.info(f"Scaled data saved to {df_scaled_file}")
 
     return df, scaler
-
 ##############################################
 # Custom Trading Environment
 ##############################################
@@ -596,6 +580,7 @@ class SingleStockTradingEnv(gym.Env):
                 proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
                 self.position -= shares_to_sell
                 self.balance += proceeds
+                self.transaction_count += 1
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
             else:
                 # Either can't sell or shares_to_sell is 0; no trade occurs
@@ -741,6 +726,7 @@ def buy_and_hold_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, tr
     df.to_csv(bh_after_dropna_file, index=True)
     main_logger.info(f"[Strategy: Buy and Hold] DataFrame after dropping NaNs saved to {bh_after_dropna_file}")
 
+    # Ensure numeric types
     if not all(pd.api.types.is_numeric_dtype(df[col]) for col in required_cols):
         main_logger.error(f"[Strategy: Buy and Hold] Required columns have non-numeric data.")
         return {
@@ -826,16 +812,14 @@ def buy_and_hold_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, tr
 
     # Save DataFrame after strategy execution
     bh_after_strategy_file = RESULTS_DIR / "buy_and_hold_after_strategy.csv"
-    history_df.to_csv(bh_after_strategy_file, index=True)
-    main_logger.info(f"[Strategy: Buy and Hold] Transaction history saved to {bh_after_strategy_file}")
+    history_df.to_csv(bh_after_strategy_file, index=False)
+    main_logger.info(f"[Strategy: Buy and Hold] History after strategy saved to {bh_after_strategy_file}")
 
     return {
         'Strategy': 'Buy and Hold',
         'Initial Balance': initial_balance,
         'Final Net Worth': net_worth,
-        'Profit': profit,
-        'Invested Capital': invested_capital,
-        'Transaction Costs': cost
+        'Profit': profit
     }, history_df
 
 def moving_average_crossover_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5) -> Tuple[dict, pd.DataFrame]:
@@ -843,10 +827,10 @@ def moving_average_crossover_with_iloc(df: pd.DataFrame, initial_balance: float 
     Implements a Moving Average Crossover strategy with DataFrame adjustments to prevent KeyError.
 
     Args:
-        df (pd.DataFrame): DataFrame containing stock prices and indicators.
+        df (pd.DataFrame): DataFrame containing stock prices.
         initial_balance (float): Starting balance.
         transaction_cost (float): Transaction cost per trade.
-        max_position_size (float): Maximum position size as a fraction of net worth.
+        max_position_size (float): Maximum proportion of balance to use when buying.
 
     Returns:
         Tuple[dict, pd.DataFrame]: Results of the strategy and the transaction history DataFrame.
@@ -863,6 +847,8 @@ def moving_average_crossover_with_iloc(df: pd.DataFrame, initial_balance: float 
     holdings = 0
     net_worth = initial_balance
     history = []
+    buy_price = 0.0
+    sell_price = 0.0
 
     required_cols = ['SMA10_unscaled', 'SMA50_unscaled', 'Close_unscaled']
     if not all(col in df.columns for col in required_cols):
@@ -881,88 +867,73 @@ def moving_average_crossover_with_iloc(df: pd.DataFrame, initial_balance: float 
     df.to_csv(ma_after_dropna_file, index=True)
     main_logger.info(f"[Strategy: Moving Average Crossover] DataFrame after dropping NaNs saved to {ma_after_dropna_file}")
 
-    if not all(pd.api.types.is_numeric_dtype(df[col]) for col in required_cols):
-        main_logger.error(f"[Strategy: Moving Average Crossover] Required columns have non-numeric data.")
-        return {
-            'Strategy': 'Moving Average Crossover',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    for idx in range(1, len(df)):
+        prev_sma10 = df.iloc[idx - 1]['SMA10_unscaled']
+        prev_sma50 = df.iloc[idx - 1]['SMA50_unscaled']
+        current_sma10 = df.iloc[idx]['SMA10_unscaled']
+        current_sma50 = df.iloc[idx]['SMA50_unscaled']
+        close_price = df.iloc[idx]['Close_unscaled']
+        date = df.iloc[idx]['Date']
 
-    try:
-        for i in range(1, len(df)):
-            # Golden cross
-            if (df.iloc[i-1]['SMA10_unscaled'] < df.iloc[i-1]['SMA50_unscaled']) and (df.iloc[i]['SMA10_unscaled'] >= df.iloc[i]['SMA50_unscaled']):
-                # Buy
-                shares_to_buy = math.floor(max_position_size * balance / df.iloc[i]['Close_unscaled'])
-                # If calculated shares_to_buy is zero but you can afford at least one share, buy one
-                if shares_to_buy == 0:
-                    one_share_cost = df.iloc[i]['Close_unscaled'] * (1 + transaction_cost)
-                    if one_share_cost <= balance:
-                        shares_to_buy = 1
+        # Buy signal: SMA10 crosses above SMA50
+        if prev_sma10 < prev_sma50 and current_sma10 > current_sma50:
+            # Buy signal
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / close_price)
 
-                # Always Check Affordability
-                total_cost = shares_to_buy * df.iloc[i]['Close_unscaled'] * (1 + transaction_cost)
-                if shares_to_buy > 0 and total_cost <= balance:
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * close_price * (1 + transaction_cost)
+                if total_cost <= balance:
                     balance -= total_cost
                     holdings += shares_to_buy
+                    buy_price = close_price
                     history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': df.iloc[i]['Close_unscaled'],
+                        'Date': date,
+                        'Close_unscaled': close_price,
                         'Action': 'Buy',
-                        'Buy_Signal_Price': df.iloc[i]['Close_unscaled'],
+                        'Buy_Signal_Price': close_price,
                         'Sell_Signal_Price': np.nan,
-                        'Net Worth': balance + holdings * df.iloc[i]['Close_unscaled'],
+                        'Net Worth': balance + holdings * close_price,
                         'Balance': balance,
                         'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
+                        'Reward': 0.0
                     })
-                    training_logger.debug(f"[Strategy: Moving Average Crossover] Step {i}: Bought {shares_to_buy} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-                    training_logger.info(f"[Strategy: Moving Average Crossover] Step {i}: Bought {shares_to_buy} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-            # Death cross
-            elif (df.iloc[i-1]['SMA10_unscaled'] > df.iloc[i-1]['SMA50_unscaled']) and (df.iloc[i]['SMA10_unscaled'] <= df.iloc[i]['SMA50_unscaled']):
-                # Sell
-                shares_to_sell = math.floor(0.5 * holdings)
-                # If shares_to_sell ended up as 0 but you have shares, try selling at least 1 share
-                if shares_to_sell == 0 and holdings > 0:
-                    shares_to_sell = 1
+                    main_logger.debug(f"[Strategy: Moving Average Crossover] Bought {shares_to_buy} shares at {close_price:.2f} on {date}")
+        # Sell signal: SMA10 crosses below SMA50
+        elif prev_sma10 > prev_sma50 and current_sma10 < current_sma50:
+            # Sell signal
+            shares_to_sell = holdings  # Sell all holdings
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * close_price * (1 - transaction_cost)
+                balance += proceeds
+                holdings = 0
+                sell_price = close_price
+                net_worth = balance
+                profit = (sell_price - buy_price) * shares_to_sell
+                reward = profit / initial_balance
+                history.append({
+                    'Date': date,
+                    'Close_unscaled': close_price,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': np.nan,
+                    'Sell_Signal_Price': close_price,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+                main_logger.debug(f"[Strategy: Moving Average Crossover] Sold {shares_to_sell} shares at {close_price:.2f} on {date}, Profit: ${profit:.2f}")
 
-                # Always Check Affordability
-                if shares_to_sell > 0 and shares_to_sell <= holdings:
-                    proceeds = shares_to_sell * df.iloc[i]['Close_unscaled'] * (1 - transaction_cost)
-                    balance += proceeds
-                    holdings -= shares_to_sell
-                    history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': df.iloc[i]['Close_unscaled'],
-                        'Action': 'Sell',
-                        'Buy_Signal_Price': np.nan,
-                        'Sell_Signal_Price': df.iloc[i]['Close_unscaled'],
-                        'Net Worth': balance + holdings * df.iloc[i]['Close_unscaled'],
-                        'Balance': balance,
-                        'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
-                    })
-                    training_logger.debug(f"[Strategy: Moving Average Crossover] Step {i}: Sold {shares_to_sell} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-                    training_logger.info(f"[Strategy: Moving Average Crossover] Step {i}: Sold {shares_to_sell} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-            # If Hold, do nothing
-            net_worth = balance + holdings * df.iloc[i]['Close_unscaled']
-            net_worth = float(net_worth)  # Ensure net_worth is a float
-    except Exception as e:
-        main_logger.error(f"[Strategy: Moving Average Crossover] Error during strategy execution: {e}")
-        return {
-            'Strategy': 'Moving Average Crossover',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    # Calculate final net worth
+    final_price = df.iloc[-1]['Close_unscaled']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
 
-    # Record the final state if holding shares
+    # Record final sell if holding any
     if holdings > 0:
-        final_price = df.iloc[-1]['Close_unscaled']
         proceeds = holdings * final_price * (1 - transaction_cost)
         balance += proceeds
+        profit += (final_price - buy_price) * holdings
         history.append({
             'Date': df.iloc[-1]['Date'],
             'Close_unscaled': final_price,
@@ -972,47 +943,42 @@ def moving_average_crossover_with_iloc(df: pd.DataFrame, initial_balance: float 
             'Net Worth': balance,
             'Balance': balance,
             'Position': 0,
-            'Reward': (balance - initial_balance) / initial_balance
+            'Reward': ((final_price - buy_price) * holdings) / initial_balance
         })
-        holdings = 0
-        training_logger.debug(f"[Strategy: Moving Average Crossover] Final sell of {holdings} shares at {final_price:.2f}")
-        training_logger.info(f"[Strategy: Moving Average Crossover] Final sell of {holdings} shares at {final_price:.2f}")
+        main_logger.debug(f"[Strategy: Moving Average Crossover] Final sell of {holdings} shares at {final_price:.2f} on {df.iloc[-1]['Date']}")
 
-    # Calculate final net worth and profit
-    final_net_worth = balance + holdings * df.iloc[-1]['Close_unscaled']
-    profit = final_net_worth - initial_balance
+    main_logger.info(f"[Strategy: Moving Average Crossover] Final Net Worth: ${net_worth:.2f}, Profit: ${profit:.2f}")
 
     # Save history to DataFrame
     history_df = pd.DataFrame(history)
 
     # Save DataFrame after strategy execution
     ma_after_strategy_file = RESULTS_DIR / "moving_average_crossover_after_strategy.csv"
-    history_df.to_csv(ma_after_strategy_file, index=True)
-    main_logger.info(f"[Strategy: Moving Average Crossover] Transaction history saved to {ma_after_strategy_file}")
-
-    training_logger.info(f"[Strategy: Moving Average Crossover] Final Net Worth: ${final_net_worth:.2f}, Profit: ${profit:.2f}")
+    history_df.to_csv(ma_after_strategy_file, index=False)
+    main_logger.info(f"[Strategy: Moving Average Crossover] History after strategy saved to {ma_after_strategy_file}")
 
     return {
         'Strategy': 'Moving Average Crossover',
         'Initial Balance': initial_balance,
-        'Final Net Worth': final_net_worth,
+        'Final Net Worth': net_worth,
         'Profit': profit
     }, history_df
 
 def macd_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5) -> Tuple[dict, pd.DataFrame]:
     """
-    Implements a MACD strategy with DataFrame adjustments to prevent KeyError.
+    Implements a MACD Crossover strategy with DataFrame adjustments to prevent KeyError.
 
     Args:
-        df (pd.DataFrame): DataFrame containing stock prices and MACD indicators.
+        df (pd.DataFrame): DataFrame containing stock prices.
         initial_balance (float): Starting balance.
         transaction_cost (float): Transaction cost per trade.
-        max_position_size (float): Maximum position size as a fraction of net worth.
+        max_position_size (float): Maximum proportion of balance to use when buying.
 
     Returns:
         Tuple[dict, pd.DataFrame]: Results of the strategy and the transaction history DataFrame.
     """
-    df = df.reset_index(drop=True)  # Reset index to ensure proper index
+    # Reset index without changing column cases
+    df = df.reset_index(drop=True)
 
     # Save DataFrame before strategy execution
     macd_before_file = RESULTS_DIR / "macd_strategy_before.csv"
@@ -1023,6 +989,8 @@ def macd_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, t
     holdings = 0
     net_worth = initial_balance
     history = []
+    buy_price = 0.0
+    sell_price = 0.0
 
     required_cols = ['MACD_unscaled', 'Close_unscaled']
     if not all(col in df.columns for col in required_cols):
@@ -1041,88 +1009,71 @@ def macd_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, t
     df.to_csv(macd_after_dropna_file, index=True)
     main_logger.info(f"[Strategy: MACD Crossover] DataFrame after dropping NaNs saved to {macd_after_dropna_file}")
 
-    if not all(pd.api.types.is_numeric_dtype(df[col]) for col in required_cols):
-        main_logger.error(f"[Strategy: MACD Crossover] Required columns have non-numeric data.")
-        return {
-            'Strategy': 'MACD Crossover',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    for idx in range(1, len(df)):
+        prev_macd = df.iloc[idx - 1]['MACD_unscaled']
+        current_macd = df.iloc[idx]['MACD_unscaled']
+        close_price = df.iloc[idx]['Close_unscaled']
+        date = df.iloc[idx]['Date']
 
-    try:
-        for i in range(1, len(df)):
-            current_macd = df.iloc[i]['MACD_unscaled']
-            previous_macd = df.iloc[i-1]['MACD_unscaled']
-            current_price = df.iloc[i]['Close_unscaled']
+        # Buy signal: MACD crosses above zero line
+        if prev_macd < 0 and current_macd > 0:
+            # Buy signal
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / close_price)
 
-            if (previous_macd < 0) and (current_macd >= 0):
-                # Buy logic
-                shares_to_buy = math.floor(max_position_size * balance / current_price)
-                if shares_to_buy == 0:
-                    one_share_cost = current_price * (1 + transaction_cost)
-                    if one_share_cost <= balance:
-                        shares_to_buy = 1
-
-                # Always Check Affordability
-                total_cost = shares_to_buy * current_price * (1 + transaction_cost)
-                if shares_to_buy > 0 and total_cost <= balance:
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * close_price * (1 + transaction_cost)
+                if total_cost <= balance:
                     balance -= total_cost
                     holdings += shares_to_buy
+                    buy_price = close_price
                     history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': current_price,
+                        'Date': date,
+                        'Close_unscaled': close_price,
                         'Action': 'Buy',
-                        'Buy_Signal_Price': current_price,
+                        'Buy_Signal_Price': close_price,
                         'Sell_Signal_Price': np.nan,
-                        'Net Worth': balance + holdings * current_price,
+                        'Net Worth': balance + holdings * close_price,
                         'Balance': balance,
                         'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
+                        'Reward': 0.0
                     })
-                    training_logger.debug(f"[Strategy: MACD Crossover] Step {i}: Bought {shares_to_buy} shares at {current_price:.2f}")
-                    training_logger.info(f"[Strategy: MACD Crossover] Step {i}: Bought {shares_to_buy} shares at {current_price:.2f}")
-            elif (previous_macd > 0) and (current_macd <= 0):
-                # Sell logic
-                shares_to_sell = math.floor(0.5 * holdings)
-                if shares_to_sell == 0 and holdings > 0:
-                    shares_to_sell = 1
+                    main_logger.debug(f"[Strategy: MACD Crossover] Bought {shares_to_buy} shares at {close_price:.2f} on {date}")
+        # Sell signal: MACD crosses below zero line
+        elif prev_macd > 0 and current_macd < 0:
+            # Sell signal
+            shares_to_sell = holdings  # Sell all holdings
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * close_price * (1 - transaction_cost)
+                balance += proceeds
+                holdings = 0
+                sell_price = close_price
+                net_worth = balance
+                profit = (sell_price - buy_price) * shares_to_sell
+                reward = profit / initial_balance
+                history.append({
+                    'Date': date,
+                    'Close_unscaled': close_price,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': np.nan,
+                    'Sell_Signal_Price': close_price,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+                main_logger.debug(f"[Strategy: MACD Crossover] Sold {shares_to_sell} shares at {close_price:.2f} on {date}, Profit: ${profit:.2f}")
 
-                # Always Check Affordability
-                if shares_to_sell > 0 and shares_to_sell <= holdings:
-                    proceeds = shares_to_sell * current_price * (1 - transaction_cost)
-                    balance += proceeds
-                    holdings -= shares_to_sell
-                    history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': current_price,
-                        'Action': 'Sell',
-                        'Buy_Signal_Price': np.nan,
-                        'Sell_Signal_Price': current_price,
-                        'Net Worth': balance + holdings * current_price,
-                        'Balance': balance,
-                        'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
-                    })
-                    training_logger.debug(f"[Strategy: MACD Crossover] Step {i}: Sold {shares_to_sell} shares at {current_price:.2f}")
-                    training_logger.info(f"[Strategy: MACD Crossover] Step {i}: Sold {shares_to_sell} shares at {current_price:.2f}")
-            # If Hold, do nothing
-            net_worth = balance + holdings * df.iloc[i]['Close_unscaled']
-            net_worth = float(net_worth)  # Ensure net_worth is a float
-    except Exception as e:
-        main_logger.error(f"[Strategy: MACD Crossover] Error during strategy execution: {e}")
-        return {
-            'Strategy': 'MACD Crossover',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    # Calculate final net worth
+    final_price = df.iloc[-1]['Close_unscaled']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
 
-    # Record the final state if holding shares
+    # Record final sell if holding any
     if holdings > 0:
-        final_price = df.iloc[-1]['Close_unscaled']
         proceeds = holdings * final_price * (1 - transaction_cost)
         balance += proceeds
+        profit += (final_price - buy_price) * holdings
         history.append({
             'Date': df.iloc[-1]['Date'],
             'Close_unscaled': final_price,
@@ -1131,59 +1082,51 @@ def macd_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, t
             'Sell_Signal_Price': final_price,
             'Net Worth': balance,
             'Balance': balance,
-            'Position': holdings,
-            'Reward': (balance - initial_balance) / initial_balance
+            'Position': 0,
+            'Reward': ((final_price - buy_price) * holdings) / initial_balance
         })
-        holdings = 0
-        training_logger.debug(f"[Strategy: MACD Crossover] Final sell of {holdings} shares at {final_price:.2f}")
-        training_logger.info(f"[Strategy: MACD Crossover] Final sell of {holdings} shares at {final_price:.2f}")
+        main_logger.debug(f"[Strategy: MACD Crossover] Final sell of {holdings} shares at {final_price:.2f} on {df.iloc[-1]['Date']}")
 
-    # Calculate final net worth and profit
-    final_net_worth = balance + holdings * df.iloc[-1]['Close_unscaled']
-    profit = final_net_worth - initial_balance
+    main_logger.info(f"[Strategy: MACD Crossover] Final Net Worth: ${net_worth:.2f}, Profit: ${profit:.2f}")
 
     # Save history to DataFrame
     history_df = pd.DataFrame(history)
 
     # Save DataFrame after strategy execution
     macd_after_strategy_file = RESULTS_DIR / "macd_strategy_after_strategy.csv"
-    history_df.to_csv(macd_after_strategy_file, index=True)
-    main_logger.info(f"[Strategy: MACD Crossover] Transaction history saved to {macd_after_strategy_file}")
-
-    training_logger.info(f"[Strategy: MACD Crossover] Final Net Worth: ${final_net_worth:.2f}, Profit: ${profit:.2f}")
+    history_df.to_csv(macd_after_strategy_file, index=False)
+    main_logger.info(f"[Strategy: MACD Crossover] History after strategy saved to {macd_after_strategy_file}")
 
     return {
         'Strategy': 'MACD Crossover',
         'Initial Balance': initial_balance,
-        'Final Net Worth': final_net_worth,
+        'Final Net Worth': net_worth,
         'Profit': profit
     }, history_df
 
-def bollinger_bands_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5) -> Tuple[dict, pd.DataFrame]:
+def bollinger_bands_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, 
+                                       transaction_cost: float = 0.001, max_position_size: float = 0.5) -> Tuple[dict, pd.DataFrame]:
     """
-    Implements a Bollinger Bands strategy with DataFrame adjustments to prevent KeyError.
+    Implements a Bollinger Bands strategy using DataFrame indexing.
 
     Args:
-        df (pd.DataFrame): DataFrame containing stock prices and Bollinger Bands.
+        df (pd.DataFrame): DataFrame containing stock prices.
         initial_balance (float): Starting balance.
         transaction_cost (float): Transaction cost per trade.
-        max_position_size (float): Maximum position size as a fraction of net worth.
+        max_position_size (float): Maximum proportion of balance to use when buying.
 
     Returns:
         Tuple[dict, pd.DataFrame]: Results of the strategy and the transaction history DataFrame.
     """
-    # Reset index without changing column cases
+    import math  # Ensure math is imported
+    # Reset index to ensure proper row alignment
     df = df.reset_index(drop=True)
-
-    # Save DataFrame before strategy execution
-    bb_before_file = RESULTS_DIR / "bollinger_bands_before.csv"
-    df.to_csv(bb_before_file, index=True)
-    main_logger.info(f"[Strategy: Bollinger Bands] DataFrame before strategy saved to {bb_before_file}")
 
     balance = initial_balance
     holdings = 0
     net_worth = initial_balance
     history = []
+    buy_price = None  # Initialize as None to handle cases with no prior buy
 
     required_cols = ['BB_Upper_unscaled', 'BB_Lower_unscaled', 'Close_unscaled']
     if not all(col in df.columns for col in required_cols):
@@ -1202,129 +1145,117 @@ def bollinger_bands_strategy_with_iloc(df: pd.DataFrame, initial_balance: float 
     df.to_csv(bb_after_dropna_file, index=True)
     main_logger.info(f"[Strategy: Bollinger Bands] DataFrame after dropping NaNs saved to {bb_after_dropna_file}")
 
-    if not all(pd.api.types.is_numeric_dtype(df[col]) for col in required_cols):
-        main_logger.error(f"[Strategy: Bollinger Bands] Required columns have non-numeric data.")
-        return {
-            'Strategy': 'Bollinger Bands',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    for idx in range(1, len(df)):
+        prev_close = df.iloc[idx - 1]['Close_unscaled']
+        prev_bb_lower = df.iloc[idx - 1]['BB_Lower_unscaled']
+        prev_bb_upper = df.iloc[idx - 1]['BB_Upper_unscaled']
+        current_close = df.iloc[idx]['Close_unscaled']
+        current_bb_upper = df.iloc[idx]['BB_Upper_unscaled']
+        current_bb_lower = df.iloc[idx]['BB_Lower_unscaled']
+        date = df.iloc[idx]['Date']
 
-    try:
-        for i in range(len(df)):
-            # Buy when price crosses below lower band
-            if df.iloc[i]['Close_unscaled'] < df.iloc[i]['BB_Lower_unscaled']:
-                shares_to_buy = math.floor(max_position_size * balance / df.iloc[i]['Close_unscaled'])
-                if shares_to_buy == 0:
-                    one_share_cost = df.iloc[i]['Close_unscaled'] * (1 + transaction_cost)
-                    if one_share_cost <= balance:
-                        shares_to_buy = 1
+        # Buy signal: Price crosses below lower Bollinger Band
+        if prev_close >= prev_bb_lower and current_close < current_bb_lower:
+            # Buy shares with max position size
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / current_close)
 
-                # Always Check Affordability
-                total_cost = shares_to_buy * df.iloc[i]['Close_unscaled'] * (1 + transaction_cost)
-                if shares_to_buy > 0 and total_cost <= balance:
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * current_close * (1 + transaction_cost)
+                if total_cost <= balance:
                     balance -= total_cost
                     holdings += shares_to_buy
+                    buy_price = current_close  # Update buy_price only on successful buy
                     history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': df.iloc[i]['Close_unscaled'],
+                        'Date': date,
+                        'Close_unscaled': current_close,
                         'Action': 'Buy',
-                        'Buy_Signal_Price': df.iloc[i]['Close_unscaled'],
-                        'Sell_Signal_Price': np.nan,
-                        'Net Worth': balance + holdings * df.iloc[i]['Close_unscaled'],
+                        'Buy_Signal_Price': current_close,
+                        'Sell_Signal_Price': None,
+                        'Net Worth': balance + holdings * current_close,
                         'Balance': balance,
                         'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
+                        'Reward': 0.0  # Reward placeholder
                     })
-                    training_logger.debug(f"[Strategy: Bollinger Bands] Step {i}: Bought {shares_to_buy} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-                    training_logger.info(f"[Strategy: Bollinger Bands] Step {i}: Bought {shares_to_buy} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-            # Sell when price crosses above upper band
-            elif df.iloc[i]['Close_unscaled'] > df.iloc[i]['BB_Upper_unscaled']:
-                shares_to_sell = math.floor(0.5 * holdings)
-                if shares_to_sell == 0 and holdings > 0:
-                    shares_to_sell = 1
+                    main_logger.debug(f"[Strategy: Bollinger Bands] Bought {shares_to_buy} shares at {current_close:.2f} on {date}")
 
-                # Always Check Affordability
-                if shares_to_sell > 0 and shares_to_sell <= holdings:
-                    proceeds = shares_to_sell * df.iloc[i]['Close_unscaled'] * (1 - transaction_cost)
-                    balance += proceeds
-                    holdings -= shares_to_sell
-                    history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': df.iloc[i]['Close_unscaled'],
-                        'Action': 'Sell',
-                        'Buy_Signal_Price': np.nan,
-                        'Sell_Signal_Price': df.iloc[i]['Close_unscaled'],
-                        'Net Worth': balance + holdings * df.iloc[i]['Close_unscaled'],
-                        'Balance': balance,
-                        'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
-                    })
-                    training_logger.debug(f"[Strategy: Bollinger Bands] Step {i}: Sold {shares_to_sell} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-                    training_logger.info(f"[Strategy: Bollinger Bands] Step {i}: Sold {shares_to_sell} shares at {df.iloc[i]['Close_unscaled']:.2f}")
-            # If Hold, do nothing
-            net_worth = balance + holdings * df.iloc[i]['Close_unscaled']
-            net_worth = float(net_worth)  # Ensure net_worth is a float
-    except Exception as e:
-        main_logger.error(f"[Strategy: Bollinger Bands] Error during strategy execution: {e}")
-        return {
-            'Strategy': 'Bollinger Bands',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+        # Sell signal: Price crosses above upper Bollinger Band
+        elif prev_close <= prev_bb_upper and current_close > current_bb_upper:
+            # Sell signal
+            if holdings > 0 and buy_price is not None:
+                shares_to_sell = holdings  # Sell all holdings
+                proceeds = shares_to_sell * current_close * (1 - transaction_cost)
+                profit = (current_close - buy_price) * shares_to_sell
+                balance += proceeds
+                net_worth = balance
+                reward = profit / initial_balance
+                holdings = 0
+                sell_price = current_close
+                history.append({
+                    'Date': date,
+                    'Close_unscaled': current_close,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': None,
+                    'Sell_Signal_Price': current_close,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+                main_logger.debug(f"[Strategy: Bollinger Bands] Sold {shares_to_sell} shares at {current_close:.2f} on {date}, Profit: ${profit:.2f}")
+            else:
+                main_logger.debug(f"[Strategy: Bollinger Bands] Sell signal triggered but no holdings to sell or buy_price is undefined.")
 
-    # Record the final state if holding shares
-    if holdings > 0:
-        final_price = df.iloc[-1]['Close_unscaled']
-        proceeds = holdings * final_price * (1 - transaction_cost)
+    # Calculate final net worth
+    final_price = df.iloc[-1]['Close_unscaled']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
+
+    # Record final sell if holding any
+    if holdings > 0 and buy_price is not None:
+        shares_to_sell = holdings
+        proceeds = shares_to_sell * final_price * (1 - transaction_cost)
+        profit += (final_price - buy_price) * shares_to_sell
         balance += proceeds
+        net_worth = balance
+        reward = (final_price - buy_price) * shares_to_sell / initial_balance
         history.append({
             'Date': df.iloc[-1]['Date'],
             'Close_unscaled': final_price,
             'Action': 'Sell',
-            'Buy_Signal_Price': np.nan,
+            'Buy_Signal_Price': None,
             'Sell_Signal_Price': final_price,
-            'Net Worth': balance,
+            'Net Worth': net_worth,
             'Balance': balance,
-            'Position': holdings,
-            'Reward': (balance - initial_balance) / initial_balance
+            'Position': 0,
+            'Reward': reward
         })
-        holdings = 0
-        training_logger.debug(f"[Strategy: Bollinger Bands] Final sell of {holdings} shares at {final_price:.2f}")
-        training_logger.info(f"[Strategy: Bollinger Bands] Final sell of {holdings} shares at {final_price:.2f}")
+        main_logger.debug(f"[Strategy: Bollinger Bands] Final sell of {shares_to_sell} shares at {final_price:.2f} on {df.iloc[-1]['Date']}")
 
-    # Calculate final net worth and profit
-    final_net_worth = balance + holdings * df.iloc[-1]['Close_unscaled']
-    profit = final_net_worth - initial_balance
-
-    # Save history to DataFrame
+    # Convert history to DataFrame
     history_df = pd.DataFrame(history)
 
-    # Save DataFrame after strategy execution
+    # Save history to DataFrame
     bb_after_strategy_file = RESULTS_DIR / "bollinger_bands_after_strategy.csv"
-    history_df.to_csv(bb_after_strategy_file, index=True)
-    main_logger.info(f"[Strategy: Bollinger Bands] Transaction history saved to {bb_after_strategy_file}")
-
-    training_logger.info(f"[Strategy: Bollinger Bands] Final Net Worth: ${final_net_worth:.2f}, Profit: ${profit:.2f}")
+    history_df.to_csv(bb_after_strategy_file, index=False)
+    main_logger.info(f"[Strategy: Bollinger Bands] History after strategy saved to {bb_after_strategy_file}")
 
     return {
         'Strategy': 'Bollinger Bands',
         'Initial Balance': initial_balance,
-        'Final Net Worth': final_net_worth,
+        'Final Net Worth': net_worth,
         'Profit': profit
     }, history_df
 
 def random_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5) -> Tuple[dict, pd.DataFrame]:
     """
-    Implements a Random strategy with DataFrame adjustments to prevent KeyError.
+    Implements a Random trading strategy with DataFrame adjustments to prevent KeyError.
 
     Args:
         df (pd.DataFrame): DataFrame containing stock prices.
         initial_balance (float): Starting balance.
         transaction_cost (float): Transaction cost per trade.
-        max_position_size (float): Maximum position size as a fraction of net worth.
+        max_position_size (float): Maximum proportion of balance to use when buying.
 
     Returns:
         Tuple[dict, pd.DataFrame]: Results of the strategy and the transaction history DataFrame.
@@ -1335,16 +1266,18 @@ def random_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000,
     # Save DataFrame before strategy execution
     random_before_file = RESULTS_DIR / "random_strategy_before.csv"
     df.to_csv(random_before_file, index=True)
-    main_logger.info(f"[Strategy: Random Strategy] DataFrame before strategy saved to {random_before_file}")
+    main_logger.info(f"[Strategy: Random] DataFrame before strategy saved to {random_before_file}")
 
     balance = initial_balance
     holdings = 0
     net_worth = initial_balance
     history = []
+    buy_price = 0.0
+    sell_price = 0.0
 
     required_cols = ['Close_unscaled']
     if not all(col in df.columns for col in required_cols):
-        main_logger.error(f"[Strategy: Random Strategy] Required columns are missing: {required_cols}")
+        main_logger.error(f"[Strategy: Random] Required columns are missing: {required_cols}")
         return {
             'Strategy': 'Random Strategy',
             'Initial Balance': initial_balance,
@@ -1357,86 +1290,82 @@ def random_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000,
     # Save DataFrame after dropping NaNs
     random_after_dropna_file = RESULTS_DIR / "random_strategy_after_dropna.csv"
     df.to_csv(random_after_dropna_file, index=True)
-    main_logger.info(f"[Strategy: Random Strategy] DataFrame after dropping NaNs saved to {random_after_dropna_file}")
+    main_logger.info(f"[Strategy: Random] DataFrame after dropping NaNs saved to {random_after_dropna_file}")
 
-    if not all(pd.api.types.is_numeric_dtype(df[col]) for col in required_cols):
-        main_logger.error(f"[Strategy: Random Strategy] Required columns have non-numeric data.")
-        return {
-            'Strategy': 'Random Strategy',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    for idx in range(1, len(df)):
+        action = random.choice(['Buy', 'Sell', 'Hold'])
+        close_price = df.iloc[idx]['Close_unscaled']
+        date = df.iloc[idx]['Date']
 
-    try:
-        for i in range(len(df)):
-            action = random.choice(['Buy', 'Sell', 'Hold'])
-            current_price = df.iloc[i]['Close_unscaled']
-            if action == 'Buy':
-                shares_to_buy = math.floor(max_position_size * balance / current_price)
-                if shares_to_buy == 0:
-                    one_share_cost = current_price * (1 + transaction_cost)
-                    if one_share_cost <= balance:
-                        shares_to_buy = 1
+        if action == 'Buy':
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / close_price)
 
-                # Always Check Affordability
-                total_cost = shares_to_buy * current_price * (1 + transaction_cost)
-                if shares_to_buy > 0 and total_cost <= balance:
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * close_price * (1 + transaction_cost)
+                if total_cost <= balance:
                     balance -= total_cost
                     holdings += shares_to_buy
+                    buy_price = close_price
                     history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': current_price,
+                        'Date': date,
+                        'Close_unscaled': close_price,
                         'Action': 'Buy',
-                        'Buy_Signal_Price': current_price,
+                        'Buy_Signal_Price': close_price,
                         'Sell_Signal_Price': np.nan,
-                        'Net Worth': balance + holdings * current_price,
+                        'Net Worth': balance + holdings * close_price,
                         'Balance': balance,
                         'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
+                        'Reward': 0.0
                     })
-                    training_logger.debug(f"[Strategy: Random Strategy] Step {i}: Bought {shares_to_buy} shares at {current_price:.2f}")
-                    training_logger.info(f"[Strategy: Random Strategy] Step {i}: Bought {shares_to_buy} shares at {current_price:.2f}")
-            elif action == 'Sell':
-                shares_to_sell = math.floor(0.5 * holdings)
-                if shares_to_sell == 0 and holdings > 0:
-                    shares_to_sell = 1
+                    main_logger.debug(f"[Strategy: Random] Bought {shares_to_buy} shares at {close_price:.2f} on {date}")
+        elif action == 'Sell':
+            shares_to_sell = holdings  # Sell all holdings
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * close_price * (1 - transaction_cost)
+                balance += proceeds
+                holdings = 0
+                sell_price = close_price
+                net_worth = balance
+                profit = (sell_price - buy_price) * shares_to_sell
+                reward = profit / initial_balance
+                history.append({
+                    'Date': date,
+                    'Close_unscaled': close_price,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': np.nan,
+                    'Sell_Signal_Price': close_price,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+                main_logger.debug(f"[Strategy: Random] Sold {shares_to_sell} shares at {close_price:.2f} on {date}, Profit: ${profit:.2f}")
+        else:
+            # Hold action; no operation
+            history.append({
+                'Date': date,
+                'Close_unscaled': close_price,
+                'Action': 'Hold',
+                'Buy_Signal_Price': np.nan,
+                'Sell_Signal_Price': np.nan,
+                'Net Worth': balance + holdings * close_price,
+                'Balance': balance,
+                'Position': holdings,
+                'Reward': 0.0
+            })
+            main_logger.debug(f"[Strategy: Random] Held position on {date}")
 
-                # Always Check Affordability
-                if shares_to_sell > 0 and shares_to_sell <= holdings:
-                    proceeds = shares_to_sell * current_price * (1 - transaction_cost)
-                    balance += proceeds
-                    holdings -= shares_to_sell
-                    history.append({
-                        'Date': df.iloc[i]['Date'],
-                        'Close_unscaled': current_price,
-                        'Action': 'Sell',
-                        'Buy_Signal_Price': np.nan,
-                        'Sell_Signal_Price': current_price,
-                        'Net Worth': balance + holdings * current_price,
-                        'Balance': balance,
-                        'Position': holdings,
-                        'Reward': 0.0  # Reward can be calculated later
-                    })
-                    training_logger.debug(f"[Strategy: Random Strategy] Step {i}: Sold {shares_to_sell} shares at {current_price:.2f}")
-                    training_logger.info(f"[Strategy: Random Strategy] Step {i}: Sold {shares_to_sell} shares at {current_price:.2f}")
-            # If Hold, do nothing
-            net_worth = balance + holdings * df.iloc[i]['Close_unscaled']
-            net_worth = float(net_worth)  # Ensure net_worth is a float
-    except Exception as e:
-        main_logger.error(f"[Strategy: Random Strategy] Error during strategy execution: {e}")
-        return {
-            'Strategy': 'Random Strategy',
-            'Initial Balance': initial_balance,
-            'Final Net Worth': net_worth,
-            'Profit': 0.0
-        }, pd.DataFrame()
+    # Calculate final net worth
+    final_price = df.iloc[-1]['Close_unscaled']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
 
-    # Record the final state if holding shares
+    # Record final sell if holding any
     if holdings > 0:
-        final_price = df.iloc[-1]['Close_unscaled']
         proceeds = holdings * final_price * (1 - transaction_cost)
         balance += proceeds
+        profit += (final_price - buy_price) * holdings
         history.append({
             'Date': df.iloc[-1]['Date'],
             'Close_unscaled': final_price,
@@ -1445,387 +1374,82 @@ def random_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000,
             'Sell_Signal_Price': final_price,
             'Net Worth': balance,
             'Balance': balance,
-            'Position': holdings,
-            'Reward': (balance - initial_balance) / initial_balance
+            'Position': 0,
+            'Reward': ((final_price - buy_price) * holdings) / initial_balance
         })
-        holdings = 0
-        training_logger.debug(f"[Strategy: Random Strategy] Final sell of {holdings} shares at {final_price:.2f}")
-        training_logger.info(f"[Strategy: Random Strategy] Final sell of {holdings} shares at {final_price:.2f}")
+        main_logger.debug(f"[Strategy: Random] Final sell of {holdings} shares at {final_price:.2f} on {df.iloc[-1]['Date']}")
 
-    # Calculate final net worth and profit
-    final_net_worth = balance + holdings * df.iloc[-1]['Close_unscaled']
-    profit = final_net_worth - initial_balance
+    main_logger.info(f"[Strategy: Random] Final Net Worth: ${net_worth:.2f}, Profit: ${profit:.2f}")
 
     # Save history to DataFrame
     history_df = pd.DataFrame(history)
 
     # Save DataFrame after strategy execution
     random_after_strategy_file = RESULTS_DIR / "random_strategy_after_strategy.csv"
-    history_df.to_csv(random_after_strategy_file, index=True)
-    main_logger.info(f"[Strategy: Random Strategy] Transaction history saved to {random_after_strategy_file}")
-
-    training_logger.info(f"[Strategy: Random Strategy] Final Net Worth: ${final_net_worth:.2f}, Profit: ${profit:.2f}")
+    history_df.to_csv(random_after_strategy_file, index=False)
+    main_logger.info(f"[Strategy: Random] History after strategy saved to {random_after_strategy_file}")
 
     return {
         'Strategy': 'Random Strategy',
         'Initial Balance': initial_balance,
-        'Final Net Worth': final_net_worth,
+        'Final Net Worth': net_worth,
         'Profit': profit
     }, history_df
 
 ##############################################
-# Evaluation and Plotting Functions
+# Plotting Functions
 ##############################################
 
-def plot_rl_training_history(rl_df: pd.DataFrame, pdf: PdfPages):
+def plot_rl_training_history(training_history: pd.DataFrame, pdf: PdfPages):
     """
-    Plots the RL agent's net worth and rewards over time.
+    Plots the RL Agent's training history, including net worth and rewards over time.
 
     Args:
-        rl_df (pd.DataFrame): DataFrame containing the RL agent's trading history.
+        training_history (pd.DataFrame): DataFrame containing the RL agent's training history.
         pdf (PdfPages): PdfPages object to save the plot.
     """
-    if rl_df.empty:
-        main_logger.error("RL history is empty. Cannot plot training history.")
+    if training_history.empty:
+        main_logger.error("RL training history is empty. Cannot plot training history.")
         return
 
     plt.figure(figsize=(14, 7))
     sns.set_style("darkgrid")
 
-    # Plot Net Worth
-    plt.subplot(2, 1, 1)
-    sns.lineplot(x=rl_df.index, y=rl_df['Net Worth'], label='Net Worth', color='blue')
-    plt.title('RL Agent Net Worth Over Time')
-    plt.xlabel('Step')
-    plt.ylabel('Net Worth ($)')
-    plt.legend()
-    plt.grid(True)
+    sns.lineplot(x='Date', y='Net Worth', data=training_history, label='Net Worth')
+    sns.lineplot(x='Date', y='Reward', data=training_history, label='Reward', color='orange')
 
-    # Plot Reward
-    plt.subplot(2, 1, 2)
-    sns.lineplot(x=rl_df.index, y=rl_df['Reward'], label='Reward', color='green')
-    plt.title('RL Agent Reward Over Time')
-    plt.xlabel('Step')
-    plt.ylabel('Reward')
-    plt.legend()
-    plt.grid(True)
-
-    plt.tight_layout()
-    pdf.savefig()
-    plt.close()
-    main_logger.info("RL training history plotted successfully.")
-
-def plot_drawdown_movements(rl_test_df: pd.DataFrame, pdf: PdfPages):
-    """
-    Plots drawdown movements over time for the RL strategy.
-
-    Args:
-        rl_test_df (pd.DataFrame): DataFrame containing the RL agent's test trading history.
-            Expected to have at least 'Date' and 'Net Worth' columns.
-        pdf (PdfPages): PdfPages object to save the plot.
-    """
-    if rl_test_df.empty:
-        main_logger.error("RL test history is empty. Cannot plot drawdown movements.")
-        return
-
-    if 'Net Worth' not in rl_test_df.columns:
-        main_logger.error("'Net Worth' column is missing from RL test history. Cannot plot drawdown movements.")
-        return
-
-    if 'Date' not in rl_test_df.columns:
-        main_logger.error("'Date' column is missing from RL test history. Cannot plot drawdown movements.")
-        return
-
-    # Ensure 'Date' is in datetime format
-    if not np.issubdtype(rl_test_df['Date'].dtype, np.datetime64):
-        try:
-            rl_test_df['Date'] = pd.to_datetime(rl_test_df['Date'])
-            main_logger.debug("'Date' column converted to datetime.")
-        except Exception as e:
-            main_logger.error(f"Error converting 'Date' column to datetime: {e}")
-            return
-
-    # Calculate Rolling Maximum Net Worth
-    rolling_max = rl_test_df['Net Worth'].cummax()
-    drawdown = (rl_test_df['Net Worth'] - rolling_max) / rolling_max
-
-    # Create a DataFrame for plotting
-    drawdown_df = rl_test_df[['Date']].copy()
-    drawdown_df['Drawdown'] = drawdown
-
-    # Check for any missing values in 'Drawdown'
-    if drawdown_df['Drawdown'].isnull().any():
-        main_logger.warning("Missing values detected in 'Drawdown'. These will be filled with 0.")
-        drawdown_df['Drawdown'].fillna(0, inplace=True)
-
-    plt.figure(figsize=(14, 7))
-    sns.set_style("darkgrid")
-
-    try:
-        # Plot Drawdown over Time
-        sns.lineplot(
-            x='Date',
-            y='Drawdown',
-            data=drawdown_df,
-            label='Drawdown',
-            color='red'
-        )
-    except Exception as e:
-        main_logger.error(f"Error plotting drawdown movements: {e}")
-        return
-
-    plt.title('RL Agent Drawdown Movements Over Time')
+    plt.title('RL Agent Training History')
     plt.xlabel('Date')
-    plt.ylabel('Drawdown')
+    plt.ylabel('Value')
     plt.legend()
     plt.tight_layout()
 
     try:
         pdf.savefig()
-        main_logger.info("Drawdown movements plotted successfully.")
+        main_logger.info("RL training history plotted successfully.")
     except Exception as e:
-        main_logger.error(f"Error saving drawdown plot to PDF: {e}")
+        main_logger.error(f"Error saving RL training history plot: {e}")
     finally:
         plt.close()
 
-def plot_all_buy_sell_signals(strategy_history: dict, pdf: PdfPages):
+def plot_reward_movements(test_history: pd.DataFrame, pdf: PdfPages):
     """
-    Plots buy and sell signals for each strategy separately.
+    Plots the reward movements of the RL Agent over the test period.
 
     Args:
-        strategy_history (dict): Dictionary containing history DataFrames for each strategy.
-        pdf (PdfPages): PdfPages object to save the plots.
-    """
-    for strategy, df in strategy_history.items():
-        if df.empty:
-            main_logger.warning(f"No history data for strategy: {strategy}. Skipping buy/sell signals plot.")
-            continue
-
-        if 'Close_unscaled' not in df.columns:
-            main_logger.warning(f"'Close_unscaled' column missing for strategy: {strategy}. Skipping plot.")
-            continue
-
-        plt.figure(figsize=(14,7))
-        sns.set_style("darkgrid")
-        sns.lineplot(x='Date', y='Close_unscaled', data=df, label='Close Price', color='blue', alpha=0.6)
-
-        # Plot Buy Signals
-        buy_signals = df[df['Buy_Signal_Price'].notna()]
-        if not buy_signals.empty:
-            sns.scatterplot(x='Date', y='Buy_Signal_Price', data=buy_signals, label='Buy Signal', color='green', marker='^', s=100)
-
-        # Plot Sell Signals
-        sell_signals = df[df['Sell_Signal_Price'].notna()]
-        if not sell_signals.empty:
-            sns.scatterplot(x='Date', y='Sell_Signal_Price', data=sell_signals, label='Sell Signal', color='red', marker='v', s=100)
-
-        plt.title(f'{strategy} - Buy and Sell Signals on Test Data')
-        plt.xlabel('Date')
-        plt.ylabel('Price ($)')
-        plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
-        plt.tight_layout()
-        try:
-            pdf.savefig()
-            main_logger.info(f"Buy/Sell signals plotted for strategy: {strategy}.")
-        except Exception as e:
-            main_logger.error(f"Error saving buy/sell signals plot for strategy {strategy}: {e}")
-        finally:
-            plt.close()
-
-def plot_transaction_costs(strategy_results: list, pdf: PdfPages):
-    """
-    Plots transaction costs for each strategy.
-
-    Args:
-        strategy_results (list): List of tuples containing strategy results and history DataFrames.
+        test_history (pd.DataFrame): DataFrame containing the RL agent's test trading history.
         pdf (PdfPages): PdfPages object to save the plot.
     """
-    strategies = []
-    transaction_costs = []
-    for result, _ in strategy_results:
-        if 'Transaction Costs' in result:
-            strategies.append(result['Strategy'])
-            transaction_costs.append(result['Transaction Costs'])
-
-    if not strategies:
-        main_logger.warning("No transaction cost data available. Skipping transaction costs plot.")
-        return
-
-    plt.figure(figsize=(10,6))
-    sns.set_style("darkgrid")
-    sns.barplot(x=strategies, y=transaction_costs, palette='viridis')
-    plt.title('Transaction Costs per Strategy')
-    plt.xlabel('Strategy')
-    plt.ylabel('Transaction Costs ($)')
-    plt.tight_layout()
-    try:
-        pdf.savefig()
-        main_logger.info("Transaction costs plotted successfully.")
-    except Exception as e:
-        main_logger.error(f"Error saving transaction costs plot: {e}")
-    finally:
-        plt.close()
-
-def plot_cash_balance(strategy_results: list, pdf: PdfPages):
-    """
-    Plots final cash balance for each strategy.
-
-    Args:
-        strategy_results (list): List of tuples containing strategy results and history DataFrames.
-        pdf (PdfPages): PdfPages object to save the plot.
-    """
-    strategies = []
-    final_balances = []
-    for result, _ in strategy_results:
-        strategies.append(result['Strategy'])
-        final_net_worth = result['Final Net Worth']
-        final_balances.append(final_net_worth)
-
-    plt.figure(figsize=(10,6))
-    sns.set_style("darkgrid")
-    sns.barplot(x=strategies, y=final_balances, palette='magma')
-    plt.title('Final Net Worth per Strategy')
-    plt.xlabel('Strategy')
-    plt.ylabel('Final Net Worth ($)')
-    plt.tight_layout()
-    try:
-        pdf.savefig()
-        main_logger.info("Final net worth plotted successfully.")
-    except Exception as e:
-        main_logger.error(f"Error saving final net worth plot: {e}")
-    finally:
-        plt.close()
-
-def plot_transaction_count(strategy_results: list, pdf: PdfPages):
-    """
-    Plots transaction count for each strategy.
-
-    Args:
-        strategy_results (list): List of tuples containing strategy results and history DataFrames.
-        pdf (PdfPages): PdfPages object to save the plot.
-    """
-    strategies = []
-    transaction_counts = []
-    for result, history_df in strategy_results:
-        # Count 'Buy' and 'Sell' actions
-        if not history_df.empty:
-            count = history_df['Action'].value_counts().get('Buy', 0) + history_df['Action'].value_counts().get('Sell', 0)
-        else:
-            count = 0
-        strategies.append(result['Strategy'])
-        transaction_counts.append(count)
-
-    if not strategies:
-        main_logger.warning("No transaction count data available. Skipping transaction count plot.")
-        return
-
-    plt.figure(figsize=(10,6))
-    sns.set_style("darkgrid")
-    sns.barplot(x=strategies, y=transaction_counts, palette='coolwarm')
-    plt.title('Transaction Count per Strategy')
-    plt.xlabel('Strategy')
-    plt.ylabel('Transaction Count')
-    plt.tight_layout()
-    try:
-        pdf.savefig()
-        main_logger.info("Transaction count plotted successfully.")
-    except Exception as e:
-        main_logger.error(f"Error saving transaction count plot: {e}")
-    finally:
-        plt.close()
-
-def plot_profit_comparison(strategy_results: list, pdf: PdfPages):
-    """
-    Plots profit comparison among each strategy.
-
-    Args:
-        strategy_results (list): List of tuples containing strategy results and history DataFrames.
-        pdf (PdfPages): PdfPages object to save the plot.
-    """
-    strategies = []
-    profits = []
-    for result, _ in strategy_results:
-        strategies.append(result['Strategy'])
-        profits.append(result['Profit'])
-
-    plt.figure(figsize=(10,6))
-    sns.set_style("darkgrid")
-    sns.barplot(x=strategies, y=profits, palette='Set2')
-    plt.title('Profit Comparison Among Strategies')
-    plt.xlabel('Strategy')
-    plt.ylabel('Profit ($)')
-    plt.tight_layout()
-    try:
-        pdf.savefig()
-        main_logger.info("Profit comparison plotted successfully.")
-    except Exception as e:
-        main_logger.error(f"Error saving profit comparison plot: {e}")
-    finally:
-        plt.close()
-
-def plot_comparison(test_df: pd.DataFrame, rl_test_df: pd.DataFrame, baseline_results: list, initial_balance: float, ticker: str, pdf: PdfPages):
-    """
-    Plots the RL agent's performance against baseline strategies.
-
-    Args:
-        test_df (pd.DataFrame): Test data.
-        rl_test_df (pd.DataFrame): RL agent's test history.
-        baseline_results (list): List of tuples containing baseline strategy results and history DataFrames.
-        initial_balance (float): Initial balance for strategies.
-        ticker (str): Stock ticker.
-        pdf (PdfPages): PdfPages object to save the plot.
-    """
-    if rl_test_df.empty:
-        main_logger.error("RL test history is empty. Cannot plot comparison.")
-        return
-
-    plt.figure(figsize=(14, 7))
-    sns.set_style("darkgrid")
-
-    # Plot RL Agent's Net Worth
-    sns.lineplot(x='Date', y='Net Worth', data=rl_test_df, label='RL Agent', color='blue')
-
-    # Plot Baseline Strategies' Net Worth
-    for result, history_df in baseline_results:
-        strategy = result['Strategy']
-        if history_df.empty or 'Net Worth' not in history_df.columns:
-            main_logger.warning(f"No Net Worth data for strategy: {strategy}. Skipping plot.")
-            continue
-        # Extract Net Worth over time
-        sns.lineplot(x='Date', y='Net Worth', data=history_df, label=strategy, linestyle='--')
-
-    plt.title(f'RL Agent vs Baseline Strategies on {ticker} Test Data')
-    plt.xlabel('Date')
-    plt.ylabel('Net Worth ($)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    try:
-        pdf.savefig()
-        main_logger.critical(f"Comparison plot between RL agent and baseline strategies saved successfully in {PLOTS_DIR}")
-    except Exception as e:
-        main_logger.error(f"Error saving comparison plot: {e}")
-    finally:
-        plt.close()
-
-def plot_reward_movements(rl_test_df: pd.DataFrame, pdf: PdfPages):
-    """
-    Plots the reward movements over time for the RL strategy.
-
-    Args:
-        rl_test_df (pd.DataFrame): DataFrame containing the RL agent's test trading history.
-        pdf (PdfPages): PdfPages object to save the plot.
-    """
-    if rl_test_df.empty:
+    if test_history.empty:
         main_logger.error("RL test history is empty. Cannot plot reward movements.")
         return
 
     plt.figure(figsize=(14, 7))
     sns.set_style("darkgrid")
 
-    sns.lineplot(x='Date', y='Reward', data=rl_test_df, label='Reward', color='purple')
+    sns.lineplot(x='Date', y='Reward', data=test_history, label='Reward', color='green')
 
-    plt.title('RL Agent Reward Movements Over Time')
+    plt.title('RL Agent Reward Movements Over Test Period')
     plt.xlabel('Date')
     plt.ylabel('Reward')
     plt.legend()
@@ -1839,22 +1463,22 @@ def plot_reward_movements(rl_test_df: pd.DataFrame, pdf: PdfPages):
     finally:
         plt.close()
 
-def plot_position_movements(rl_test_df: pd.DataFrame, pdf: PdfPages):
+def plot_position_movements(test_history: pd.DataFrame, pdf: PdfPages):
     """
-    Plots the position movements over time for the RL strategy.
+    Plots the position movements of the RL Agent over the test period.
 
     Args:
-        rl_test_df (pd.DataFrame): DataFrame containing the RL agent's test trading history.
+        test_history (pd.DataFrame): DataFrame containing the RL agent's test trading history.
         pdf (PdfPages): PdfPages object to save the plot.
     """
-    if rl_test_df.empty:
+    if test_history.empty:
         main_logger.error("RL test history is empty. Cannot plot position movements.")
         return
 
     plt.figure(figsize=(14, 7))
     sns.set_style("darkgrid")
 
-    sns.lineplot(x='Date', y='Position', data=rl_test_df, label='Position', color='orange')
+    sns.lineplot(x='Date', y='Position', data=test_history, label='Position (Shares)', color='purple')
 
     plt.title('RL Agent Position Movements Over Time')
     plt.xlabel('Date')
@@ -1867,6 +1491,273 @@ def plot_position_movements(rl_test_df: pd.DataFrame, pdf: PdfPages):
         main_logger.info("Position movements plotted successfully.")
     except Exception as e:
         main_logger.error(f"Error saving position movements plot: {e}")
+    finally:
+        plt.close()
+
+def plot_drawdown_movements(test_history: pd.DataFrame, pdf: PdfPages):
+    """
+    Plots the drawdown movements of the RL Agent over the test period.
+
+    Args:
+        test_history (pd.DataFrame): DataFrame containing the RL agent's test trading history.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    if test_history.empty:
+        main_logger.error("RL test history is empty. Cannot plot drawdown movements.")
+        return
+
+    net_worth_series = test_history['Net Worth']
+    rolling_max = net_worth_series.cummax()
+    drawdown = (net_worth_series - rolling_max) / rolling_max
+
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+
+    sns.lineplot(x=test_history['Date'], y=drawdown, label='Drawdown', color='red')
+
+    plt.title('RL Agent Drawdown Movements Over Time')
+    plt.xlabel('Date')
+    plt.ylabel('Drawdown')
+    plt.legend()
+    plt.tight_layout()
+
+    try:
+        pdf.savefig()
+        main_logger.info("Drawdown movements plotted successfully.")
+    except Exception as e:
+        main_logger.error(f"Error saving drawdown movements plot: {e}")
+    finally:
+        plt.close()
+
+def plot_all_buy_sell_signals(strategy_history: dict, pdf: PdfPages):
+    """
+    Plots buy and sell signals for each strategy along with relevant technical indicators.
+
+    Args:
+        strategy_history (dict): Dictionary containing strategy names as keys and their history DataFrames as values.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    for strategy, history_df in strategy_history.items():
+        if history_df.empty:
+            main_logger.warning(f"History for strategy '{strategy}' is empty. Skipping plot.")
+            continue
+
+        plt.figure(figsize=(14, 7))
+        sns.set_style("darkgrid")
+
+        dates = history_df['Date']
+        close_prices = history_df['Close_unscaled']
+        plt.plot(dates, close_prices, label='Close Price', color='blue')
+
+        # Plot Buy and Sell Signals
+        buy_signals = history_df[history_df['Action'] == 'Buy']
+        sell_signals = history_df[history_df['Action'] == 'Sell']
+
+        plt.scatter(buy_signals['Date'], buy_signals['Close_unscaled'], marker='^', color='green', label='Buy Signal', alpha=1)
+        plt.scatter(sell_signals['Date'], sell_signals['Close_unscaled'], marker='v', color='red', label='Sell Signal', alpha=1)
+
+        # Add technical indicators based on strategy
+        if strategy == 'Moving Average Crossover':
+            if 'SMA10_unscaled' in history_df.columns and 'SMA50_unscaled' in history_df.columns:
+                plt.plot(history_df['Date'], history_df['SMA10_unscaled'], label='SMA10', color='orange')
+                plt.plot(history_df['Date'], history_df['SMA50_unscaled'], label='SMA50', color='magenta')
+        elif strategy == 'MACD Crossover':
+            if 'MACD_unscaled' in history_df.columns:
+                plt.plot(history_df['Date'], history_df['MACD_unscaled'], label='MACD', color='purple')
+        elif strategy == 'Bollinger Bands':
+            if 'BB_Upper_unscaled' in history_df.columns and 'BB_Lower_unscaled' in history_df.columns:
+                plt.plot(history_df['Date'], history_df['BB_Upper_unscaled'], label='Bollinger Upper Band', color='cyan')
+                plt.plot(history_df['Date'], history_df['BB_Lower_unscaled'], label='Bollinger Lower Band', color='cyan')
+
+        plt.title(f'{strategy} - Buy and Sell Signals on Test Data')
+        plt.xlabel('Date')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.tight_layout()
+
+        try:
+            pdf.savefig()
+            main_logger.info(f"Buy and Sell signals plotted successfully for strategy '{strategy}'.")
+        except Exception as e:
+            main_logger.error(f"Error saving Buy and Sell signals plot for strategy '{strategy}': {e}")
+            continue
+        finally:
+            plt.close()
+
+def plot_profit_comparison(strategy_results: list, pdf: PdfPages):
+    """
+    Plots a comparison of profits across all strategies.
+
+    Args:
+        strategy_results (list): List of tuples containing strategy results and their history DataFrames.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+
+    strategies = [result[0]['Strategy'] for result in strategy_results]
+    profits = [result[0]['Profit'] for result in strategy_results]
+
+    sns.barplot(x=strategies, y=profits, palette='viridis')
+
+    plt.title('Profit Comparison Among Strategies')
+    plt.xlabel('Strategy')
+    plt.ylabel('Profit ($)')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    try:
+        pdf.savefig()
+        main_logger.info("Profit comparison plotted successfully.")
+    except Exception as e:
+        main_logger.error(f"Error saving profit comparison plot: {e}")
+    finally:
+        plt.close()
+
+def plot_transaction_count(strategy_results: list, pdf: PdfPages):
+    """
+    Plots the number of transactions made by each strategy.
+
+    Args:
+        strategy_results (list): List of tuples containing strategy results and their history DataFrames.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    transaction_counts = []
+    strategies = []
+
+    for result, history_df in strategy_results:
+        if history_df.empty:
+            count = 0
+        else:
+            count = history_df['Action'].value_counts().get('Buy', 0) + history_df['Action'].value_counts().get('Sell', 0)
+        transaction_counts.append(count)
+        strategies.append(result['Strategy'])
+
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+
+    sns.barplot(x=strategies, y=transaction_counts, palette='magma')
+
+    plt.title('Transaction Count per Strategy')
+    plt.xlabel('Strategy')
+    plt.ylabel('Number of Transactions')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    try:
+        pdf.savefig()
+        main_logger.info("Transaction count plotted successfully.")
+    except Exception as e:
+        main_logger.error(f"Error saving transaction count plot: {e}")
+    finally:
+        plt.close()
+
+def plot_cash_balance(strategy_results: list, pdf: PdfPages):
+    """
+    Plots the final net worth of each strategy.
+
+    Args:
+        strategy_results (list): List of tuples containing strategy results and their history DataFrames.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+
+    strategies = [result[0]['Strategy'] for result in strategy_results]
+    net_worths = [result[0]['Final Net Worth'] for result in strategy_results]
+
+    sns.barplot(x=strategies, y=net_worths, palette='coolwarm')
+
+    plt.title('Final Net Worth per Strategy')
+    plt.xlabel('Strategy')
+    plt.ylabel('Net Worth ($)')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    try:
+        pdf.savefig()
+        main_logger.info("Final net worth plotted successfully.")
+    except Exception as e:
+        main_logger.error(f"Error saving final net worth plot: {e}")
+    finally:
+        plt.close()
+
+def plot_transaction_costs(strategy_results: list, pdf: PdfPages):
+    """
+    Plots the total transaction costs incurred by each strategy.
+
+    Args:
+        strategy_results (list): List of tuples containing strategy results and their history DataFrames.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    transaction_costs = []
+    strategies = []
+
+    for result, history_df in strategy_results:
+        if history_df.empty:
+            cost = 0.0
+        else:
+            buys = history_df[history_df['Action'] == 'Buy']
+            sells = history_df[history_df['Action'] == 'Sell']
+            cost = buys.shape[0] * 0.001 + sells.shape[0] * 0.001  # Assuming 0.1% cost per transaction
+        transaction_costs.append(cost)
+        strategies.append(result['Strategy'])
+
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+
+    sns.barplot(x=strategies, y=transaction_costs, palette='inferno')
+
+    plt.title('Transaction Costs per Strategy')
+    plt.xlabel('Strategy')
+    plt.ylabel('Transaction Costs ($)')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    try:
+        pdf.savefig()
+        main_logger.info("Transaction costs plotted successfully.")
+    except Exception as e:
+        main_logger.error(f"Error saving transaction costs plot: {e}")
+    finally:
+        plt.close()
+
+def plot_comparison(test_df: pd.DataFrame, rl_test_df: pd.DataFrame, strategy_results: list, initial_balance: float, ticker: str, pdf: PdfPages):
+    """
+    Plots RL Agent vs Baseline Strategies on the test data.
+
+    Args:
+        test_df (pd.DataFrame): Test data DataFrame.
+        rl_test_df (pd.DataFrame): RL agent's test history DataFrame.
+        strategy_results (list): List of tuples containing strategy results and their history DataFrames.
+        initial_balance (float): Initial balance for all strategies.
+        ticker (str): Stock ticker symbol.
+        pdf (PdfPages): PdfPages object to save the plot.
+    """
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+
+    # Plot RL Agent's Net Worth
+    if not rl_test_df.empty:
+        sns.lineplot(x='Date', y='Net Worth', data=rl_test_df, label='RL Agent', color='blue')
+
+    # Plot Baseline Strategies' Net Worth
+    for result, history_df in strategy_results:
+        if history_df.empty:
+            continue
+        sns.lineplot(x='Date', y='Net Worth', data=history_df, label=result['Strategy'])
+
+    plt.title('RL Agent vs Baseline Strategies - Net Worth Comparison')
+    plt.xlabel('Date')
+    plt.ylabel('Net Worth ($)')
+    plt.legend()
+    plt.tight_layout()
+
+    try:
+        pdf.savefig()
+        main_logger.info("RL Agent vs Baseline Strategies Net Worth comparison plotted successfully.")
+    except Exception as e:
+        main_logger.error(f"Error saving RL vs Baseline Net Worth comparison plot: {e}")
     finally:
         plt.close()
 
@@ -2186,6 +2077,7 @@ def make_env(env_params, env_rank, seed=RANDOM_SEED):
 if __name__ == "__main__":
     # Define parameters
     TICKER = 'ADVENZYMES.NS'
+    CSV_FILE_PATH = r'C:\Users\Star\.cursor-tutor\data\data_fetched.csv'  # <-- Update this path to your CSV file
     START_DATE = '2018-01-01'
     END_DATE = datetime.datetime.now().strftime('%Y-%m-%d')  # Current date
     INITIAL_BALANCE = 100000
@@ -2198,7 +2090,7 @@ if __name__ == "__main__":
 
     # Fetch and prepare data
     # Scaling is now handled within get_data
-    df, scaler = get_data(TICKER, START_DATE, END_DATE, scaler=None, fit_scaler=True)
+    df, scaler = get_data(CSV_FILE_PATH, scaler=None, fit_scaler=True)
     if df.empty:
         main_logger.critical("No data fetched. Exiting.")
         exit()
@@ -2418,7 +2310,7 @@ if __name__ == "__main__":
     start_time = time.time()
     try:
         model.learn(
-            total_timesteps=10000,  # Increased training steps
+            total_timesteps=500000,  # Increased training steps
             callback=callback_list
         )
     except Exception as e:
@@ -2524,14 +2416,16 @@ if __name__ == "__main__":
         # Correct the column name from 'net worth' to 'Net Worth'
         if 'Net Worth' in rl_test_df.columns:
             test_final_net_worth = float(rl_test_df['Net Worth'].iloc[-1])  # Ensure float
+        elif 'net worth' in rl_test_df.columns:
+            test_final_net_worth = float(rl_test_df['net worth'].iloc[-1])
         else:
             main_logger.error("Neither 'Net Worth' nor 'net worth' column found in RL test history.")
             test_final_net_worth = INITIAL_BALANCE
 
         test_profit = float(test_final_net_worth - INITIAL_BALANCE)  # Ensure float
-        if 'Net Worth' in rl_test_df.columns:
-            test_max_dd = calculate_max_drawdown(rl_test_df['Net Worth'])
-            test_annualized_return = calculate_annualized_return(rl_test_df['Net Worth'])
+        if 'Net Worth' in rl_test_df.columns or 'net worth' in rl_test_df.columns:
+            test_max_dd = calculate_max_drawdown(rl_test_df['Net Worth']) if 'Net Worth' in rl_test_df.columns else calculate_max_drawdown(rl_test_df['net worth'])
+            test_annualized_return = calculate_annualized_return(rl_test_df['Net Worth']) if 'Net Worth' in rl_test_df.columns else calculate_annualized_return(rl_test_df['net worth'])
         else:
             test_max_dd = 0.0
             test_annualized_return = 0.0
@@ -2540,6 +2434,10 @@ if __name__ == "__main__":
         test_profit = 0.0
         test_max_dd = 0.0
         test_annualized_return = 0.0
+
+    # Calculate Transaction Costs
+    rl_transaction_cost = rl_test_df['Reward'].count() * TRANSACTION_COST * INITIAL_BALANCE / 2  # Simplified estimation
+    rl_transaction_count = rl_test_df['Action'].value_counts().get('Buy', 0) + rl_test_df['Action'].value_counts().get('Sell', 0)
 
     # Save Test Environment History to CSV
     test_history_file = RESULTS_DIR / "test_env_history.csv"
@@ -2624,11 +2522,12 @@ if __name__ == "__main__":
         main_logger.critical(f"  Initial Balance: ${result['Initial Balance']}")
         main_logger.critical(f"  Final Net Worth: ${result['Final Net Worth']:.2f}")
         main_logger.critical(f"  Profit: ${result['Profit']:.2f}")
-        if 'Invested Capital' in result:
-            main_logger.critical(f"  Invested Capital: ${result['Invested Capital']:.2f}")
-            main_logger.critical(f"  Transaction Costs: ${result['Transaction Costs']:.2f}")
         if not history_df.empty:
-            main_logger.critical(f"  Total Transactions: {history_df['Action'].value_counts().get('Buy', 0) + history_df['Action'].value_counts().get('Sell', 0)}")
+            buy_count = history_df['Action'].value_counts().get('Buy', 0)
+            sell_count = history_df['Action'].value_counts().get('Sell', 0)
+            main_logger.critical(f"  Total Transactions: {buy_count + sell_count}")
+        else:
+            main_logger.critical(f"  Total Transactions: 0")
         main_logger.critical("-" * 50)
 
     # Log and print RL Agent Results on Test Data
@@ -2637,6 +2536,9 @@ if __name__ == "__main__":
     main_logger.critical(f"  Profit: ${test_profit:.2f}")
     main_logger.critical(f"  Annualized Return: {test_annualized_return*100:.2f}%")
     main_logger.critical(f"  Max Drawdown: {test_max_dd*100:.2f}%")
+    main_logger.critical(f"  Transaction Costs: ${rl_transaction_cost:.2f}")
+    main_logger.critical(f"  Transaction Count: {int(rl_transaction_count)}")
+    main_logger.critical("-" * 50)
 
     ##############################################
     # Plotting All Results to PDF
@@ -2707,3 +2609,4 @@ if __name__ == "__main__":
     log_phase("All Phases", "Completed", {"total_duration_seconds": total_duration}, total_duration)
 
     main_logger.info("Script execution completed successfully.")
+
