@@ -635,24 +635,25 @@ class SingleStockTradingEnv(gym.Env):
         self.peak = max(self.peak, net_worth)
         current_drawdown = (self.peak - net_worth) / self.peak if self.peak > 0 else 0.0
 
-        drawdown_excess = current_drawdown - self.max_drawdown
-        if drawdown_excess > 0:
-            drawdown_penalty = -self.some_factor * drawdown_excess
-        else:
-            drawdown_penalty = 0.0
+        # Compute Sharpe bonus if enough data is available
+		sharpe_bonus = 0.0
+		if len(self.returns_window) >= 10:
+			mean_return = np.mean(self.returns_window)
+			std_return = np.std(self.returns_window) + 1e-9
+			sharpe_bonus = mean_return / std_return  # or Sortino
 
-		# New transaction penalty and holding bonus logic
-		if action_value != 0:
-			transaction_penalty = -0.001
+		# Drawdown penalty if current_drawdown > max_drawdown
+		drawdown_excess = current_drawdown - self.max_drawdown
+		if drawdown_excess > 0:
+			drawdown_penalty = -self.some_factor * drawdown_excess
 		else:
-			transaction_penalty = 0.0
+			drawdown_penalty = 0.0
 
-		holding_bonus = 0.0
-		if action_value == 0 and net_worth >= self.prev_net_worth:
-			holding_bonus = 0.0005  # small bonus for holding when net worth is stable or rising
+		# Penalize repeated trades if action is not hold
+		transaction_penalty = -0.001 if action_value != 0 else 0.0
 
-		# Total Reward
-        reward = (profit_reward + drawdown_penalty + transaction_penalty + holding_bonus) * (self.reward_weights['reward_scale'] if self.reward_weights else 1.0)
+		# Compute final reward using the redesigned formula
+		reward = sharpe_bonus * 0.01 + drawdown_penalty + transaction_penalty
 
         # Normalize the reward
         normalized_reward = reward
