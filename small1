@@ -596,64 +596,86 @@ class SingleStockTradingEnv(gym.Env):
         net_worth = self.balance + self.position * current_price
         net_worth = float(net_worth)  # Ensure net_worth is a float
 
-		# Implement Stop-Loss Check
-        if net_worth <= self.initial_balance * self.stop_loss:
-            shares_to_sell = self.position
-            if shares_to_sell > 0:
-                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-                self.balance += proceeds
-                self.position = 0
-            terminated = True
-            truncated = False
-            reward = -1.0
-            obs = self._next_observation()
-            return obs, reward, terminated, truncated, {}
+		# =============== Implement net-worth-based stop-loss logic (NO termination) ===============
+		if net_worth <= self.initial_balance * self.stop_loss:
+			# Force close position but keep going
+			shares_to_sell = self.position
+			if shares_to_sell > 0:
+				proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+				self.balance += proceeds
+				self.position = 0
+			# Optionally apply a small penalty
+			sl_penalty = -1.0
+		else:
+			sl_penalty = 0.0
 
-        # Implement Take-Profit Check
-        if net_worth >= self.initial_balance * self.take_profit:
-            shares_to_sell = self.position
-            if shares_to_sell > 0:
-                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-                self.balance += proceeds
-                self.position = 0
-            terminated = True
-            truncated = False
-            reward = +0.5
-            obs = self._next_observation()
-            return obs, reward, terminated, truncated, {}
-			
-        # Calculate Reward based on net worth change
-        net_worth_change = net_worth - self.prev_net_worth
-        profit_reward = net_worth_change / self.initial_balance
+		# =============== Implement net-worth-based take-profit logic (NO termination) ===============
+		if net_worth >= self.initial_balance * self.take_profit:
+			# Force partial or full close
+			shares_to_sell = self.position  # or do partial sells, e.g. half
+			if shares_to_sell > 0:
+				proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+				self.balance += proceeds
+				self.position = 0
+			# Optionally add small positive reward
+			tp_bonus = +0.5
+		else:
+			tp_bonus = 0.0
 
-        # Update returns window
-        self.returns_window.append(profit_reward)
-        if len(self.returns_window) > 30:
-            self.returns_window.pop(0)
+		# Example extension: partial thresholds
+		# if net_worth >= self.initial_balance * 1.10:
+		#     # close half
+		# if net_worth >= self.initial_balance * 1.20:
+		#     # close rest
 
-        # Penalty for high drawdown
-        self.peak = max(self.peak, net_worth)
-        current_drawdown = (self.peak - net_worth) / self.peak if self.peak > 0 else 0.0
+		# =============== Reward Components ===============
+		profit_reward = (net_worth_change / self.initial_balance) * 0.8  # Weighted
+		# Track rolling returns
+		step_return = net_worth_change / self.initial_balance
+		self.returns_window.append(step_return)
+		if len(self.returns_window) > 30:
+			self.returns_window.pop(0)
 
-        # Compute Sharpe bonus if enough data is available
-		sharpe_bonus = 0.0
+		# Compute Sharpe if we have enough data
 		if len(self.returns_window) >= 10:
 			mean_return = np.mean(self.returns_window)
 			std_return = np.std(self.returns_window) + 1e-9
-			sharpe_bonus = mean_return / std_return  # or Sortino
+			sharpe = mean_return / std_return  # or Sortino
+			sharpe_bonus = sharpe * 0.05
+		else:
+			sharpe_bonus = 0.0
 
-		# Drawdown penalty if current_drawdown > max_drawdown
+		# Drawdown penalty
+		self.peak = max(self.peak, net_worth)
+		current_drawdown = (self.peak - net_worth) / self.peak if self.peak > 0 else 0.0
 		drawdown_excess = current_drawdown - self.max_drawdown
 		if drawdown_excess > 0:
 			drawdown_penalty = -self.some_factor * drawdown_excess
 		else:
 			drawdown_penalty = 0.0
 
-		# Penalize repeated trades if action is not hold
+		# Small bonus for holding if net worth is stable or rising
+		if action_value == 0 and net_worth >= self.prev_net_worth:
+			holding_bonus = 0.0005
+		else:
+			holding_bonus = 0.0
+
+		# Transaction penalty
 		transaction_penalty = -0.001 if action_value != 0 else 0.0
 
-		# Compute final reward using the redesigned formula
-		reward = sharpe_bonus * 0.01 + drawdown_penalty + transaction_penalty
+		# =============== Sum Up Reward ===============
+		reward = (
+			profit_reward
+			+ sharpe_bonus
+			+ sl_penalty
+			+ tp_bonus
+			+ drawdown_penalty
+			+ transaction_penalty
+			+ holding_bonus
+		)
+
+		# Optionally multiply by user-defined reward_scale
+		reward *= self.reward_weights.get('reward_scale', 1.0)
 
         # Normalize the reward
         normalized_reward = reward
