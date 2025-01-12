@@ -629,7 +629,7 @@ class SingleStockTradingEnv(gym.Env):
 		#     # close rest
 
 		# =============== Reward Components ===============
-		profit_reward = (net_worth_change / self.initial_balance) * 0.8  # Weighted
+		profit_reward = (net_worth_change / self.initial_balance) * 1.5  # Weighted
 		# Track rolling returns
 		step_return = net_worth_change / self.initial_balance
 		self.returns_window.append(step_return)
@@ -656,7 +656,7 @@ class SingleStockTradingEnv(gym.Env):
 
 		# Small bonus for holding if net worth is stable or rising
 		if action_value == 0 and net_worth >= self.prev_net_worth:
-			holding_bonus = 0.0005
+			holding_bonus = 0.001
 		else:
 			holding_bonus = 0.0
 
@@ -1959,61 +1959,61 @@ def generate_unique_study_name(base_name='rl_trading_agent_study'):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{base_name}_{timestamp}"
 
-def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_position_size, max_drawdown, annual_trading_days, transaction_cost):
-    """
-    Objective function for Optuna to maximize final performance metric based on cumulative reward.
-
-    This version logs all individual properties of the environment at the end of each trial
-    for comprehensive debugging and analysis.
-    """
-    # Define hyperparameter search space    
-    learning_rate = trial.suggest_loguniform('learning_rate', 1e-5, 1e-2)
+def objective(trial, df, scaler, initial_balance, annual_trading_days):
+    # PPO hyperparameters
+    learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-3)
     n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
     batch_size = trial.suggest_categorical('batch_size', [32, 64])
-    gamma = trial.suggest_uniform('gamma', 0.90, 0.99)
+    gamma = trial.suggest_uniform('gamma', 0.98, 0.999)
     gae_lambda = trial.suggest_uniform('gae_lambda', 0.80, 1.00)
     clip_range = trial.suggest_uniform('clip_range', 0.1, 0.3)
-    ent_coef = trial.suggest_loguniform('ent_coef', 1e-5, 1e-3)
+    ent_coef = trial.suggest_loguniform('ent_coef', 1e-6, 1e-3)
     vf_coef = trial.suggest_uniform('vf_coef', 0.1, 0.5)
     max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.5, 1.0)
     net_arch = trial.suggest_categorical('net_arch', ['128_128', '256_256', '128_256_128'])
-    some_factor = trial.suggest_float('some_factor', 0.0001, 0.05, log=True)
-	
-    # Initialize training environment with these hyperparameters
+    
+    # Renamed hyperparameter for clarity
+    drawdown_penalty_factor = trial.suggest_float('drawdown_penalty_factor', 0.0001, 0.05, log=True)
+
+    # Environment hyperparameters to tune
+    tuned_stop_loss = trial.suggest_float('stop_loss', 0.80, 0.95, step=0.01)
+    tuned_take_profit = trial.suggest_float('take_profit', 1.05, 1.20, step=0.01)
+    tuned_transaction_cost = trial.suggest_float('transaction_cost', 0.0005, 0.005, step=0.0005)
+    tuned_reward_scale = trial.suggest_float('reward_scale', 0.5, 2.0, step=0.1)
+    tuned_max_position_size = trial.suggest_float('max_position_size', 0.1, 1.0, step=0.1)
+    tuned_max_drawdown = trial.suggest_float('max_drawdown', 0.1, 0.3, step=0.01)
+
+    # Create training environment with tuned hyperparameters
     env_train = SingleStockTradingEnv(
         df=df,
         scaler=scaler,
         initial_balance=initial_balance,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        max_position_size=max_position_size,
-        max_drawdown=max_drawdown,
+        stop_loss=tuned_stop_loss,
+        take_profit=tuned_take_profit,
+        max_position_size=tuned_max_position_size,
+        max_drawdown=tuned_max_drawdown,
         annual_trading_days=annual_trading_days,
-        transaction_cost=transaction_cost,
-        env_rank=trial.number + 1,  # Unique identifier for the environment
-		some_factor=some_factor,   # Using suggested factor
-        reward_weights={'reward_scale': 1.0}  # Renamed to prevent confusion
+        transaction_cost=tuned_transaction_cost,
+        env_rank=trial.number + 1,
+        some_factor=drawdown_penalty_factor,
+        reward_weights={'reward_scale': tuned_reward_scale}
     )
     env_train.seed(RANDOM_SEED + trial.number + 1)
 
-    # Using DummyVecEnv for consistency with SB3 training
     vec_env_train = DummyVecEnv([lambda: env_train])
 
-    # Define policy network architecture
     policy_kwargs = dict(
         activation_fn=torch.nn.ReLU,
         net_arch=[int(x) for x in net_arch.split('_')]
     )
 
-    # Define unique TensorBoard log directory for the trial
     trial_log_dir = TB_LOG_DIR / f"trial_{trial.number}"
     trial_log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize PPO model
     model = PPO(
         'MlpPolicy',
         vec_env_train,
-        verbose=0,  # Set to 0 to prevent SB3 logs from cluttering
+        verbose=0,
         seed=RANDOM_SEED,
         policy_kwargs=policy_kwargs,
         learning_rate=learning_rate,
@@ -2026,14 +2026,13 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         vf_coef=vf_coef,
         max_grad_norm=max_grad_norm,
         tensorboard_log=str(trial_log_dir),
-        device='cpu'  # Ensure CPU usage
+        device='cpu'
     )
 
-    # Define checkpoint callback
     trial_checkpoint_dir = RESULTS_DIR / f"checkpoints_trial_{trial.number}"
     trial_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_callback = CheckpointCallback(
-        save_freq=50000,  # Reduced frequency to prevent overload
+        save_freq=50000,
         save_path=str(trial_checkpoint_dir),
         name_prefix="ppo_model"
     )
@@ -2046,7 +2045,6 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     )
     callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
 
-    # Start training
     start_time = time.time()
     try:
         model.learn(
@@ -2055,45 +2053,26 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         )
     except Exception as e:
         main_logger.critical(f"[Trial {trial.number}] Training failed: {e}")
-        return -np.inf  # Assign a very low value to failed trials
+        return -np.inf
     duration = time.time() - start_time
 
-    # After training, access the history from the training environment
     env_train_history = env_train.history
+    cumulative_reward = sum([entry['Reward'] for entry in env_train_history]) if env_train_history else 0.0
 
-    if env_train_history:
-        cumulative_reward = sum([entry['Reward'] for entry in env_train_history])
-    else:
-        main_logger.warning(f"[Trial {trial.number}] Environment history is empty or not available.")
-        cumulative_reward = 0.0
-
-    # Log all individual properties
     main_logger.critical(f"[Trial {trial.number}] Cumulative Reward: {cumulative_reward:.4f}")
     main_logger.critical(f"[Trial {trial.number}] Final Net Worth: ${env_train.net_worth:.2f}")
     main_logger.critical(f"[Trial {trial.number}] Final Balance: ${env_train.balance:.2f}")
     main_logger.critical(f"[Trial {trial.number}] Final Position: {env_train.position} shares")
     main_logger.critical(f"[Trial {trial.number}] Total Transactions: {env_train.transaction_count}")
     main_logger.critical(f"[Trial {trial.number}] Final Peak Net Worth: ${env_train.peak:.2f}")
-
-    # Corrected final_drawdown calculation
     final_drawdown = (env_train.peak - env_train.net_worth) / env_train.peak if env_train.peak > 0 else 0.0
     main_logger.critical(f"[Trial {trial.number}] Final Drawdown: {final_drawdown*100:.2f}%")
 
-    # Optionally, log additional properties from the history
-    if env_train_history:
-        last_history = env_train_history[-1]
-        history_details = "\n".join([f"{key}: {value}" for key, value in last_history.items()])
-        main_logger.critical(f"[Trial {trial.number}] Last Step History:\n{history_details}")
-    else:
-        main_logger.warning(f"[Trial {trial.number}] Environment history is empty or not available.")
-
-    # Persist Environment History to CSV
     trial_log_file = RESULTS_DIR / f"trial_{trial.number}_history.csv"
     if env_train_history:
         pd.DataFrame(env_train_history).to_csv(trial_log_file, index=False)
         main_logger.info(f"[Trial {trial.number}] Environment history saved to {trial_log_file}")
     else:
-        # Save an empty DataFrame or with default values if history is empty
         pd.DataFrame().to_csv(trial_log_file, index=False)
         main_logger.warning(f"[Trial {trial.number}] Environment history was empty. Saved empty CSV at {trial_log_file}")
 
