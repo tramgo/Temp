@@ -515,7 +515,8 @@ class SingleStockTradingEnv(gym.Env):
                 'Net Worth': self.net_worth,
                 'Balance': self.balance,
                 'Position': self.position,
-                'Reward': reward
+                'Reward': reward,
+                'Trade_Cost': 0.0
             })
             training_logger.error(f"[Env {self.env_rank}] Terminating episode at step {self.current_step} due to data overflow.")
             return obs, reward, terminated, truncated, {}
@@ -643,7 +644,8 @@ class SingleStockTradingEnv(gym.Env):
             'Net Worth': net_worth,
             'Balance': self.balance,
             'Position': self.position,
-            'Reward': normalized_reward
+            'Reward': normalized_reward,
+            'Trade_Cost': trade_cost
         })
         training_logger.debug(f"[Env {self.env_rank}] History appended at step {self.current_step}. Current History Length: {len(self.history)}")
 
@@ -1803,11 +1805,13 @@ class EarlyStoppingCallback(BaseCallback):
 
 class CustomTensorboardCallback(BaseCallback):
     """
-    Custom callback for logging additional metrics to TensorBoard.
-    Logs net worth, reward, and elapsed time.
+    Custom callback for logging a rolling average of rewards to TensorBoard,
+    as well as final metrics at the end of training.
     """
-    def __init__(self, verbose=0):
+    def __init__(self, verbose=0, window_size=100):
         super(CustomTensorboardCallback, self).__init__(verbose)
+        self.window_size = window_size
+        self.rewards_buffer = []
         self.start_time = None
 
     def _on_training_start(self) -> None:
@@ -1817,35 +1821,64 @@ class CustomTensorboardCallback(BaseCallback):
         # Access the environment
         env = self.training_env.envs[0]
 
-        # Log net worth and reward if history is not empty
+        # Log rolling average of reward if history is available
         if hasattr(env, 'history') and env.history:
-            last_history = env.history[-1]
-            self.logger.record("train/net_worth_env", last_history.get('Net Worth', 0.0))
-            self.logger.record("train/balance_env", last_history.get('Balance', 0.0))
-            self.logger.record("train/position_env", last_history.get('Position', 0.0))
-            self.logger.record("train/reward_env", last_history.get('Reward', 0.0))
+            last_step = env.history[-1]
+            recent_reward = last_step.get('Reward', 0.0)
+            self.rewards_buffer.append(recent_reward)
+
+            # Keep the buffer size limited to 'window_size'
+            if len(self.rewards_buffer) > self.window_size:
+                self.rewards_buffer.pop(0)
+
+            # Calculate the rolling average reward
+            rolling_avg_reward = np.mean(self.rewards_buffer)
+
+            # Record it under "train/reward_env" so early stopping can monitor this
+            self.logger.record("train/reward_env", rolling_avg_reward)
+
+            # Log additional metrics like net worth, balance, or position if desired
+            self.logger.record("train/net_worth_env", last_step.get('Net Worth', 0.0))
+            self.logger.record("train/balance_env", last_step.get('Balance', 0.0))
+            self.logger.record("train/position_env", last_step.get('Position', 0.0))
 
         # Log elapsed time
         if self.start_time:
-            elapsed_time = time.time() - self.start_time  # in seconds
-            elapsed_time_formatted = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
+            elapsed_time = time.time() - self.start_time
+            formatted_time = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
             self.logger.record("train/elapsed_time_env", elapsed_time)
-            self.logger.record("train/elapsed_time_formatted_env", elapsed_time_formatted)
+            self.logger.record("train/elapsed_time_formatted_env", formatted_time)
 
         return True
 
     def _on_training_end(self) -> None:
+        # Access the environment
         env = self.training_env.envs[0]
+
+        # Log final metrics at the end of training
         if hasattr(env, 'history') and env.history:
+            # Final net worth, balance, etc.
             self.logger.record("train/final_net_worth", env.history[-1].get('Net Worth', 0.0))
             self.logger.record("train/final_reward", sum(h['Reward'] for h in env.history))
             self.logger.record("train/final_balance", env.history[-1].get('Balance', 0.0))
             self.logger.record("train/final_position", env.history[-1].get('Position', 0.0))
+
+            # Optionally compute a final rolling average over last 'window_size' steps
+            rewards_slice = [step.get('Reward', 0.0) for step in env.history[-self.window_size:]]
+            if rewards_slice:
+                final_rolling_avg = np.mean(rewards_slice)
+            else:
+                final_rolling_avg = 0.0
+            self.logger.record("train/final_rolling_avg_reward", final_rolling_avg)
+
         else:
+            # If no history or environment is empty, log zeros
             self.logger.record("train/final_net_worth", 0.0)
             self.logger.record("train/final_reward", 0.0)
             self.logger.record("train/final_balance", 0.0)
             self.logger.record("train/final_position", 0.0)
+            self.logger.record("train/final_rolling_avg_reward", 0.0)
+
 
 ##############################################
 # Additional Utility Functions
@@ -1990,7 +2023,7 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     custom_callback = CustomTensorboardCallback()
     early_stopping_callback = EarlyStoppingCallback(
         monitor='train/reward_env',
-        patience=3000,
+        patience=20000,
         min_delta=1e-5,
         verbose=1
     )
@@ -1999,7 +2032,7 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     start_time = time.time()
     try:
         model.learn(
-            total_timesteps=30000,
+            total_timesteps=100000,
             callback=callback_list
         )
     except Exception as e:
@@ -2435,8 +2468,10 @@ if __name__ == "__main__":
         test_annualized_return = 0.0
 
     # Calculate Transaction Costs
-    rl_transaction_cost = rl_test_df['Reward'].count() * TRANSACTION_COST * INITIAL_BALANCE / 2  # Simplified estimation
-    rl_transaction_count = rl_test_df['Action'].value_counts().get('Buy', 0) + rl_test_df['Action'].value_counts().get('Sell', 0)
+    rl_transaction_cost = rl_test_df['Trade_Cost'].sum()
+    num_buys = (rl_test_df['Action'] > 0).sum()
+    num_sells = (rl_test_df['Action'] < 0).sum()
+    rl_transaction_count = num_buys + num_sells    
 
     # Save Test Environment History to CSV
     test_history_file = RESULTS_DIR / "test_env_history.csv"
