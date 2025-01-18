@@ -364,6 +364,7 @@ class SingleStockTradingEnv(gym.Env):
                  annual_trading_days: int = 252, transaction_cost: float = 0.001,
                  env_rank: int = 0,
                  some_factor: float = 0.01,  # Default or override
+                 hold_threshold: float = 0.1, 
                  reward_weights: Optional[dict] = None):
         super(SingleStockTradingEnv, self).__init__()
 
@@ -380,6 +381,7 @@ class SingleStockTradingEnv(gym.Env):
         self.max_drawdown = max_drawdown
         self.annual_trading_days = annual_trading_days
         self.transaction_cost = transaction_cost  # 0.1% per trade
+        self.hold_threshold = hold_threshold
 
         # Action space: Continuous actions between -1 and 1
         # Negative values: Sell proportion of holdings
@@ -503,9 +505,9 @@ class SingleStockTradingEnv(gym.Env):
 
         invalid_action_penalty = -0.01  # Small penalty for invalid buy/sell actions
 
-        hold_threshold = 0.1
+        hold_threshold = self.hold_threshold  # Use the tunable threshold from environment
         if abs(action_value) <= hold_threshold:
-            action_value = 0.0
+            action_value = 0.0  # Treat action as Hold
             training_logger.debug(f"[Env {self.env_rank}] Treating action {action} as Hold (within ±{hold_threshold}).")
 
         if self.current_step >= len(self.df):
@@ -551,8 +553,7 @@ class SingleStockTradingEnv(gym.Env):
                 trade_cost = shares_traded * current_price * self.transaction_cost
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Bought {shares_to_buy} shares at {current_price:.2f}")
             else:
-                # Penalize invalid buy action
-                reward = invalid_action_penalty
+                reward = invalid_action_penalty  # Penalize invalid buy action
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough balance to buy shares or no shares calculated.")
         elif action_value < 0:
             proportion_to_sell = abs(action_value) * self.max_position_size
@@ -568,8 +569,7 @@ class SingleStockTradingEnv(gym.Env):
                 trade_cost = shares_traded * current_price * self.transaction_cost
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
             else:
-                # Penalize invalid sell action
-                reward = invalid_action_penalty
+                reward = invalid_action_penalty  # Penalize invalid sell action
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough shares to sell or shares_to_sell=0.")
         else:
             training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Hold action received.")
@@ -639,8 +639,7 @@ class SingleStockTradingEnv(gym.Env):
             forced_tp_penalty +
             drawdown_penalty +
             transaction_penalty +
-            holding_bonus +
-			invalid_action_penalty
+            holding_bonus
         )
 
         reward *= self.reward_weights.get('reward_scale', 1.0)
@@ -663,8 +662,7 @@ class SingleStockTradingEnv(gym.Env):
             'Forced_TP_Penalty': forced_tp_penalty,
             'Drawdown_Penalty': drawdown_penalty,
             'Transaction_Penalty': transaction_penalty,
-            'Holding_Bonus': holding_bonus,
-			'Invalid Action Penalty': invalid_action_penalty
+            'Holding_Bonus': holding_bonus
         })
         training_logger.debug(f"[Env {self.env_rank}] History appended at step {self.current_step}. Current History Length: {len(self.history)}")
 
@@ -698,7 +696,6 @@ class SingleStockTradingEnv(gym.Env):
         training_logger.debug(f"[Env {self.env_rank}] After Action {action_value}: Balance = {self.balance}, Position = {self.position}, Net Worth = {net_worth}")
 
         return obs, normalized_reward, terminated, truncated, {}
-
 
 ##############################################
 # Baseline Strategies
@@ -1955,7 +1952,6 @@ def generate_unique_study_name(base_name='rl_trading_agent_study'):
 
 def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_position_size,
               max_drawdown, annual_trading_days, transaction_cost):
-    # Existing hyperparameter suggestions
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-3)
     n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
     batch_size = trial.suggest_categorical('batch_size', [32, 64])
@@ -1982,10 +1978,11 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     holding_bonus_weight = trial.suggest_float('holding_bonus_weight', 0.0, 0.002)
     transaction_penalty_scale = trial.suggest_float('transaction_penalty_scale', 0.5, 2.0)
 
-    # New hyperparameters for smooth holding incentive
     volatility_threshold = trial.suggest_float("volatility_threshold", 0.5, 2.0)
     momentum_threshold_min = trial.suggest_float("momentum_threshold_min", 30, 45)
     momentum_threshold_max = trial.suggest_float("momentum_threshold_max", 55, 70)
+
+    hold_threshold = trial.suggest_float("hold_threshold", 0.0, 0.1, step=0.01)
 
     env_train = SingleStockTradingEnv(
         df=df,
@@ -1999,6 +1996,7 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
         transaction_cost=tuned_transaction_cost,
         env_rank=trial.number + 1,
         some_factor=drawdown_penalty_factor,
+        hold_threshold=hold_threshold,
         reward_weights={
             'reward_scale': tuned_reward_scale,
             'profit_weight': profit_weight,
