@@ -639,7 +639,8 @@ class SingleStockTradingEnv(gym.Env):
             forced_tp_penalty +
             drawdown_penalty +
             transaction_penalty +
-            holding_bonus
+            holding_bonus +
+			invalid_action_penalty
         )
 
         reward *= self.reward_weights.get('reward_scale', 1.0)
@@ -662,7 +663,8 @@ class SingleStockTradingEnv(gym.Env):
             'Forced_TP_Penalty': forced_tp_penalty,
             'Drawdown_Penalty': drawdown_penalty,
             'Transaction_Penalty': transaction_penalty,
-            'Holding_Bonus': holding_bonus
+            'Holding_Bonus': holding_bonus,
+			'Invalid Action Penalty': invalid_action_penalty
         })
         training_logger.debug(f"[Env {self.env_rank}] History appended at step {self.current_step}. Current History Length: {len(self.history)}")
 
