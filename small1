@@ -501,6 +501,13 @@ class SingleStockTradingEnv(gym.Env):
             training_logger.error(f"[Env {self.env_rank}] Action validation failed: {e}")
             return self._next_observation(), -1000.0, True, False, {}
 
+        invalid_action_penalty = -0.01  # Small penalty for invalid buy/sell actions
+
+        hold_threshold = 0.1
+        if abs(action_value) <= hold_threshold:
+            action_value = 0.0
+            training_logger.debug(f"[Env {self.env_rank}] Treating action {action} as Hold (within ±{hold_threshold}).")
+
         if self.current_step >= len(self.df):
             terminated = True
             truncated = False
@@ -525,7 +532,6 @@ class SingleStockTradingEnv(gym.Env):
         current_price = float(current_data['Close_unscaled'])
         current_date = current_data['Date']
 
-        # Initialize shares_traded and trade_cost for transaction penalty calculation
         shares_traded = 0
         trade_cost = 0.0
 
@@ -545,6 +551,8 @@ class SingleStockTradingEnv(gym.Env):
                 trade_cost = shares_traded * current_price * self.transaction_cost
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Bought {shares_to_buy} shares at {current_price:.2f}")
             else:
+                # Penalize invalid buy action
+                reward = invalid_action_penalty
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough balance to buy shares or no shares calculated.")
         elif action_value < 0:
             proportion_to_sell = abs(action_value) * self.max_position_size
@@ -560,6 +568,8 @@ class SingleStockTradingEnv(gym.Env):
                 trade_cost = shares_traded * current_price * self.transaction_cost
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
             else:
+                # Penalize invalid sell action
+                reward = invalid_action_penalty
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough shares to sell or shares_to_sell=0.")
         else:
             training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Hold action received.")
@@ -568,25 +578,12 @@ class SingleStockTradingEnv(gym.Env):
         net_worth_change = net_worth - self.prev_net_worth
 
         forced_stop_penalty = 0.0
-        if net_worth <= self.initial_balance * self.stop_loss and self.position > 0:
-            shares_to_sell = self.position
-            if shares_to_sell > 0:
-                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-                self.balance += proceeds
-                self.position = 0
+        if net_worth <= self.initial_balance * self.stop_loss and self.position > 0:            
             forced_stop_penalty = -3.0
 
         forced_tp_penalty = 0.0
         if net_worth >= self.initial_balance * self.take_profit and self.position > 0:
-            shares_to_sell = self.position
-            if shares_to_sell > 0:
-                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-                self.balance += proceeds
-                self.position = 0
             forced_tp_penalty = -1.0
-
-        net_worth = float(self.balance + self.position * current_price)
-        net_worth_change = net_worth - self.prev_net_worth
 
         profit_weight = self.reward_weights.get('profit_weight', 1.5)
         sharpe_bonus_weight = self.reward_weights.get('sharpe_bonus_weight', 0.05)
@@ -612,14 +609,27 @@ class SingleStockTradingEnv(gym.Env):
         drawdown_excess = current_drawdown - self.max_drawdown
         drawdown_penalty = -self.some_factor * drawdown_excess if drawdown_excess > 0 else 0.0
 
-        if action_value == 0 and net_worth >= self.prev_net_worth:
-            holding_bonus = holding_bonus_weight
-        else:
-            holding_bonus = 0.0
+        vol_thresh = self.reward_weights.get('volatility_threshold', 1.0)
+        mom_thresh_min = self.reward_weights.get('momentum_threshold_min', 30)
+        mom_thresh_max = self.reward_weights.get('momentum_threshold_max', 70)
+        holding_bonus_weight = self.reward_weights.get('holding_bonus_weight', 0.001)
 
-        # Retrieve transaction penalty scale from reward_weights
+        hold_factor = max(0, 1 - abs(action_value)/0.1)
+
+        raw_vol = current_data['Volatility_unscaled']
+        volatility_factor = 1.0 - np.clip(raw_vol / vol_thresh, 0.0, 1.0)
+
+        raw_rsi = current_data['RSI_unscaled']
+        if mom_thresh_max > mom_thresh_min:
+            rsi_factor = (raw_rsi - mom_thresh_min) / (mom_thresh_max - mom_thresh_min)
+            rsi_factor = np.clip(rsi_factor, 0.0, 1.0)
+        else:
+            rsi_factor = 0.0
+
+        favorable_hold_factor = hold_factor * volatility_factor * rsi_factor
+        holding_bonus = favorable_hold_factor * holding_bonus_weight
+
         penalty_scale = self.reward_weights.get('transaction_penalty_scale', 1.0)
-        # Calculate scaled transaction penalty based on trade cost
         transaction_penalty = -(trade_cost / self.initial_balance) * penalty_scale
 
         reward = (
@@ -645,7 +655,14 @@ class SingleStockTradingEnv(gym.Env):
             'Balance': self.balance,
             'Position': self.position,
             'Reward': normalized_reward,
-            'Trade_Cost': trade_cost
+            'Trade_Cost': trade_cost,
+            'Profit_Reward': profit_reward,
+            'Sharpe_Bonus': sharpe_bonus,
+            'Forced_Stop_Penalty': forced_stop_penalty,
+            'Forced_TP_Penalty': forced_tp_penalty,
+            'Drawdown_Penalty': drawdown_penalty,
+            'Transaction_Penalty': transaction_penalty,
+            'Holding_Bonus': holding_bonus
         })
         training_logger.debug(f"[Env {self.env_rank}] History appended at step {self.current_step}. Current History Length: {len(self.history)}")
 
@@ -679,6 +696,7 @@ class SingleStockTradingEnv(gym.Env):
         training_logger.debug(f"[Env {self.env_rank}] After Action {action_value}: Balance = {self.balance}, Position = {self.position}, Net Worth = {net_worth}")
 
         return obs, normalized_reward, terminated, truncated, {}
+
 
 ##############################################
 # Baseline Strategies
@@ -1935,17 +1953,18 @@ def generate_unique_study_name(base_name='rl_trading_agent_study'):
 
 def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_position_size,
               max_drawdown, annual_trading_days, transaction_cost):
+    # Existing hyperparameter suggestions
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-3)
     n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
     batch_size = trial.suggest_categorical('batch_size', [32, 64])
     gamma = trial.suggest_uniform('gamma', 0.98, 0.999)
     gae_lambda = trial.suggest_uniform('gae_lambda', 0.80, 1.00)
     clip_range = trial.suggest_uniform('clip_range', 0.1, 0.3)
-    ent_coef = trial.suggest_loguniform('ent_coef', 1e-6, 1e-3)
+    ent_coef = trial.suggest_loguniform('ent_coef', 1e-4, 1e-1)
     vf_coef = trial.suggest_uniform('vf_coef', 0.1, 0.5)
     max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.5, 1.0)
     net_arch = trial.suggest_categorical('net_arch', ['128_128', '256_256', '128_256_128'])
-    
+
     drawdown_penalty_factor = trial.suggest_float('drawdown_penalty_factor', 0.0001, 0.05, log=True)
 
     tuned_stop_loss = trial.suggest_float('stop_loss', 0.80, 0.95, step=0.01)
@@ -1960,6 +1979,11 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     transaction_penalty_weight = trial.suggest_loguniform('transaction_penalty_weight', 1e-5, 1e-2)
     holding_bonus_weight = trial.suggest_float('holding_bonus_weight', 0.0, 0.002)
     transaction_penalty_scale = trial.suggest_float('transaction_penalty_scale', 0.5, 2.0)
+
+    # New hyperparameters for smooth holding incentive
+    volatility_threshold = trial.suggest_float("volatility_threshold", 0.5, 2.0)
+    momentum_threshold_min = trial.suggest_float("momentum_threshold_min", 30, 45)
+    momentum_threshold_max = trial.suggest_float("momentum_threshold_max", 55, 70)
 
     env_train = SingleStockTradingEnv(
         df=df,
@@ -1979,7 +2003,10 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
             'sharpe_bonus_weight': sharpe_bonus_weight,
             'transaction_penalty_weight': transaction_penalty_weight,
             'holding_bonus_weight': holding_bonus_weight,
-            'transaction_penalty_scale': transaction_penalty_scale
+            'transaction_penalty_scale': transaction_penalty_scale,
+            'volatility_threshold': volatility_threshold,
+            'momentum_threshold_min': momentum_threshold_min,
+            'momentum_threshold_max': momentum_threshold_max
         }
     )
     env_train.seed(RANDOM_SEED + trial.number + 1)
@@ -2023,7 +2050,7 @@ def objective(trial, df, scaler, initial_balance, stop_loss, take_profit, max_po
     custom_callback = CustomTensorboardCallback()
     early_stopping_callback = EarlyStoppingCallback(
         monitor='train/reward_env',
-        patience=20000,
+        patience=10000,
         min_delta=1e-5,
         verbose=1
     )
@@ -2330,7 +2357,7 @@ if __name__ == "__main__":
     custom_callback = CustomTensorboardCallback()
     early_stopping_callback = EarlyStoppingCallback(
         monitor='train/reward_env',
-        patience=25000,  # Increased patience
+        patience=10000,  # Increased patience
         min_delta=1e-5,  # Lowered min_delta
         verbose=1
     )
