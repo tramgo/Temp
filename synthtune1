@@ -112,27 +112,109 @@ def check_versions():
 
 check_versions()
 
-def get_data(csv_file_path: str = None, scaler: Optional[StandardScaler] = None, fit_scaler: bool = False) -> Tuple[pd.DataFrame, Optional[StandardScaler]]:
+def get_data(csv_file_path: str = None,
+             scaler: Optional[StandardScaler] = None,
+             fit_scaler: bool = False
+             ) -> Tuple[pd.DataFrame, Optional[StandardScaler]]:
     """
-    Generates synthetic stock data for 10 years with technical indicators and scales features.
+    Generates synthetic stock data for ~10 years with multiple market regimes
+    (bull, bear, sideways), random shock events (crashes, rallies), realistic
+    volume/volatility dynamics, and standard technical indicators. 
+    Then scales features if a scaler is provided or if fit_scaler is True.
     """
-    main_logger.info("Generating synthetic stock data for 10 years.")
-    # Generate date range for 10 years
-    dates = pd.date_range(end=pd.Timestamp.today(), periods=2520, freq='B')
+    main_logger.info("Generating synthetic stock data with realistic market behavior.")
+
+    # -----------------------
+    # 1) Create date range
+    # -----------------------
     np.random.seed(RANDOM_SEED)
-    # Simulate synthetic prices using a random walk
-    price = 100 + np.cumsum(np.random.randn(len(dates)))  
+    total_days = 2520  # ~10 trading years
+    dates = pd.date_range(end=pd.Timestamp.today(), periods=total_days, freq='B')
+
+    # -----------------------
+    # 2) Define market regimes
+    # -----------------------
+    possible_regimes = [
+        ("bull", 0.0008, 0.01),
+        ("bear", -0.0008, 0.015),
+        ("sideways", 0.0001, 0.005),
+    ]
+    n_segments = np.random.randint(3, 6)  
+    segment_days = []
+    while sum(segment_days) < total_days:
+        remaining = total_days - sum(segment_days)
+        next_len = np.random.randint(200, 800)
+        if sum(segment_days) + next_len > total_days:
+            next_len = remaining
+        segment_days.append(next_len)
+    if len(segment_days) > n_segments:
+        segment_days = segment_days[:n_segments-1] + [sum(segment_days[n_segments-1:])]
+
+    segments = []
+    for seg_len in segment_days:
+        regime = possible_regimes[np.random.randint(0, len(possible_regimes))]
+        segments.append((regime[0], regime[1], regime[2], seg_len))
+
+    # -----------------------
+    # 3) Generate price data
+    # -----------------------
+    base_price = 100.0
+    all_prices = []
+    for regime_name, drift, vol, seg_len in segments:
+        returns = drift + np.random.randn(seg_len) * vol
+        all_prices.append(returns)
+    returns_all = np.concatenate(all_prices, axis=0)
+    price = base_price * np.exp(np.cumsum(returns_all))
+
     df = pd.DataFrame({'Date': dates, 'Close': price})
-    df['Open'] = df['Close'] + np.random.randn(len(df))
-    df['High'] = df[['Open', 'Close']].max(axis=1) + abs(np.random.randn(len(df)))
-    df['Low'] = df[['Open', 'Close']].min(axis=1) - abs(np.random.randn(len(df)))
+
+    # -----------------------
+    # 4) Introduce shock events (crashes/rallies)
+    # -----------------------
+    n_shocks = int(0.01 * total_days)
+    shock_indices = np.random.choice(total_days, n_shocks, replace=False)
+    for idx in shock_indices:
+        shock_type = np.random.choice(["crash", "rally"])
+        shock_magnitude = np.random.uniform(0.05, 0.15)
+        if shock_type == "crash":
+            df.loc[idx:, "Close"] *= (1 - shock_magnitude)
+        else:
+            df.loc[idx:, "Close"] *= (1 + shock_magnitude)
+    price = df["Close"].values
+
+    # -----------------------
+    # 5) Create OHLC & Volume
+    # -----------------------
+    df['Open'] = df['Close'] * (1 + np.random.randn(len(df)) * 0.001)
+    df['High'] = pd.DataFrame({'o': df['Open'], 'c': df['Close']}).max(axis=1) * (1 + abs(np.random.randn(len(df))) * 0.002)
+    df['Low'] = pd.DataFrame({'o': df['Open'], 'c': df['Close']}).min(axis=1) * (1 - abs(np.random.randn(len(df))) * 0.002)
     df['Adj Close'] = df['Close']
-    df['Volume'] = np.random.randint(100, 1000, size=len(df))
+
+    base_volume = 1e6 * (df['Close'] / df['Close'].iloc[0])
+    noise = np.random.randn(len(df)) * 0.2
+    df['Volume'] = (base_volume * (1 + noise)).astype(int)
+    df.loc[shock_indices, 'Volume'] *= 2
+    df['Volume'] = df['Volume'].clip(lower=100)
 
     df.sort_values('Date', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # Calculate technical indicators as before
+    # Select specific columns and ensure they are of the correct type
+    required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+    for col in required_columns:
+        if col not in df.columns:
+            main_logger.error(f"Missing required column '{col}' in CSV file.")
+            # Save DataFrame with missing columns
+            error_file = RESULTS_DIR / f"data_error_missing_column_{col}.csv"
+            df.to_csv(error_file, index=True)
+            main_logger.info(f"Data with missing column {col} saved to {error_file}")
+            return pd.DataFrame(), scaler
+        
+    
+    
+    # -----------------------
+    # 6) Technical Indicators
+    # -----------------------
     close = df['Close']
     high = df['High']
     low = df['Low']
@@ -152,11 +234,8 @@ def get_data(csv_file_path: str = None, scaler: Optional[StandardScaler] = None,
     lagged_return = close.pct_change().fillna(0)
     atr = volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
 
-    # New indicators
-    # Volatility spike: simple proxy using ATR > threshold
-    volatility_spike = atr > atr.rolling(window=20).mean() * 1.5
-    # Price reversal: large change in opposite direction after a trend
-    price_reversal = (close.diff().abs() > close.diff().rolling(window=5).std() * 2).astype(int)
+    volatility_spike = (atr > atr.rolling(window=20).mean() * 1.5).astype(float)
+    price_reversal = ((close.diff().abs() > close.diff().rolling(window=5).std() * 2).astype(int).astype(float))
 
     indicators = {
         'SMA10': sma10,
@@ -171,23 +250,51 @@ def get_data(csv_file_path: str = None, scaler: Optional[StandardScaler] = None,
         'VWAP': vwap,
         'Lagged_Return': lagged_return,
         'Volatility': atr,
-        'Volatility_Spike': volatility_spike.astype(float),
-        'Price_Reversal': price_reversal.astype(float)
+        'Volatility_Spike': volatility_spike,
+        'Price_Reversal': price_reversal
     }
 
     for key, value in indicators.items():
         df[key] = value
 
+    # Save DataFrame after adding indicators (before scaling)
+    df_before_scaling_file = RESULTS_DIR / "data_before_scaling.csv"
+    df.to_csv(df_before_scaling_file, index=True)
+    main_logger.info(f"Data with indicators saved before scaling to {df_before_scaling_file}")
+
+    
+    # -----------------------
+    # 7) Feature Scaling
+    # -----------------------
+    # Store unscaled columns
     for feature in FEATURES_TO_SCALE:
         if feature in df.columns:
             df[f"{feature}_unscaled"] = df[feature].copy()
+            main_logger.debug(f"Added column: {feature}_unscaled")
         else:
             main_logger.error(f"Feature {feature} is missing from DataFrame. Cannot create {feature}_unscaled.")
             return pd.DataFrame(), scaler
 
+    # Save DataFrame after adding unscaled columns
+    df_after_unscaled_file = RESULTS_DIR / "data_after_unscaled.csv"
+    df.to_csv(df_after_unscaled_file, index=True)
+    main_logger.info(f"Data with unscaled features saved to {df_after_unscaled_file}")
+
     df.fillna(method='ffill', inplace=True)
     df.fillna(0, inplace=True)
     df.reset_index(drop=True, inplace=True)
+
+    # Data Validation: Check for columns filled with zeros
+    zero_filled_columns = df[required_columns].columns[(df[required_columns] == 0).all()].tolist()
+    if zero_filled_columns:
+        main_logger.error(f"One or more required columns are entirely filled with zeros: {zero_filled_columns}. Aborting data processing.")
+        # Save DataFrame with zero-filled columns
+        zero_filled_file = RESULTS_DIR / "data_zero_filled_columns.csv"
+        df.to_csv(zero_filled_file, index=True)
+        main_logger.info(f"Data with zero-filled columns saved to {zero_filled_file}")
+        return pd.DataFrame(), scaler
+
+    main_logger.info("Data fetched and processed successfully from CSV.")
 
     if fit_scaler:
         scaler = StandardScaler()
@@ -197,11 +304,21 @@ def get_data(csv_file_path: str = None, scaler: Optional[StandardScaler] = None,
         df[FEATURES_TO_SCALE] = scaler.transform(df[FEATURES_TO_SCALE])
         main_logger.debug("Features scaled using existing scaler.")
     else:
-        main_logger.error("Scaler not provided for scaling. Returning unscaled data.")
+        main_logger.warning("Scaler not provided for scaling. Returning unscaled data.")
+        # Save unscaled DataFrame
+        unscaled_file = RESULTS_DIR / "data_unscaled_final.csv"
+        df.to_csv(unscaled_file, index=True)
+        main_logger.info(f"Unscaled data saved to {unscaled_file}")
         return df, scaler
 
-    main_logger.info("Synthetic data generated and processed successfully.")
+    # Save DataFrame after scaling
+    df_scaled_file = RESULTS_DIR / "data_scaled.csv"
+    df.to_csv(df_scaled_file, index=True)
+    main_logger.info(f"Scaled data saved to {df_scaled_file}")
+
+    main_logger.info("Synthetic data generated with multiple market regimes, shocks, and technical indicators.")
     return df, scaler
+
 
 ##############################################
 # Custom Trading Environment
@@ -463,7 +580,7 @@ class SingleStockTradingEnv(gym.Env):
         self.peak = max(self.peak, net_worth)
         current_drawdown = (self.peak - net_worth) / self.peak if self.peak > 0 else 0.0
         drawdown_excess = current_drawdown - self.max_drawdown
-        drawdown_penalty = -self.some_factor * drawdown_excess * net_worth if drawdown_excess > 0 else 0.0
+        drawdown_penalty = -self.some_factor * drawdown_excess  if drawdown_excess > 0 else 0.0
 
         vol_thresh = self.reward_weights.get('volatility_threshold', 1.0)
         mom_thresh_min = self.reward_weights.get('momentum_threshold_min', 30)
@@ -483,7 +600,7 @@ class SingleStockTradingEnv(gym.Env):
             rsi_factor = 0.0
 
         favorable_hold_factor = hold_factor * volatility_factor * rsi_factor
-        holding_bonus = favorable_hold_factor * holding_bonus_weight * net_worth
+        holding_bonus = favorable_hold_factor * holding_bonus_weight 
 
         penalty_scale = self.reward_weights.get('transaction_penalty_scale', 1.0)
         transaction_penalty = -(trade_cost / self.initial_balance) * penalty_scale
@@ -496,7 +613,7 @@ class SingleStockTradingEnv(gym.Env):
             drawdown_penalty +
             transaction_penalty +
             holding_bonus +
-			invalid_action_penalty
+            invalid_action_penalty
         )
 
         reward *= self.reward_weights.get('reward_scale', 1.0)
@@ -520,8 +637,8 @@ class SingleStockTradingEnv(gym.Env):
             'Drawdown_Penalty': drawdown_penalty,
             'Transaction_Penalty': transaction_penalty,
             'Holding_Bonus': holding_bonus,
-			'Invalid_Action_Penalty': invalid_action_penalty,
-			'Favorable_Hold_Factor': favorable_hold_factor
+            'Invalid_Action_Penalty': invalid_action_penalty,
+            'Favorable_Hold_Factor': favorable_hold_factor
         })
         training_logger.debug(f"[Env {self.env_rank}] History appended at step {self.current_step}. Current History Length: {len(self.history)}")
 
@@ -1423,7 +1540,18 @@ def plot_all_buy_sell_signals(strategy_history: dict, pdf: PdfPages):
         plt.scatter(buy_signals['Date'], buy_signals['Close_unscaled'], marker='^', color='green', label='Buy Signal', alpha=1)
         plt.scatter(sell_signals['Date'], sell_signals['Close_unscaled'], marker='v', color='red', label='Sell Signal', alpha=1)
 
-        # Additional technical plots based on strategy (if applicable) can be added here
+        # Add technical indicators based on strategy
+        if strategy == 'Moving Average Crossover':
+            if 'SMA10_unscaled' in history_df.columns and 'SMA50_unscaled' in history_df.columns:
+                plt.plot(history_df['Date'], history_df['SMA10_unscaled'], label='SMA10', color='orange')
+                plt.plot(history_df['Date'], history_df['SMA50_unscaled'], label='SMA50', color='magenta')
+        elif strategy == 'MACD Crossover':
+            if 'MACD_unscaled' in history_df.columns:
+                plt.plot(history_df['Date'], history_df['MACD_unscaled'], label='MACD', color='purple')
+        elif strategy == 'Bollinger Bands':
+            if 'BB_Upper_unscaled' in history_df.columns and 'BB_Lower_unscaled' in history_df.columns:
+                plt.plot(history_df['Date'], history_df['BB_Upper_unscaled'], label='Bollinger Upper Band', color='cyan')
+                plt.plot(history_df['Date'], history_df['BB_Lower_unscaled'], label='Bollinger Lower Band', color='cyan')
 
         plt.title(f'{strategy} - Buy and Sell Signals on Test Data')
         plt.xlabel('Date')
@@ -1983,9 +2111,31 @@ if __name__ == "__main__":
 
     main_logger.info(f"Training samples: {len(train_df)}, Testing samples: {len(test_df)}")
 
+    # Save train and test data to CSV
+    train_data_file = RESULTS_DIR / f"{TICKER}_train_data.csv"
+    test_data_file = RESULTS_DIR / f"{TICKER}_test_data.csv"
+    train_df.to_csv(train_data_file, index=False)
+    test_df.to_csv(test_data_file, index=False)
+    main_logger.info(f"Training data saved to {train_data_file}")
+    main_logger.info(f"Testing data saved to {test_data_file}")
+
+    # Log test_df size and columns
+    main_logger.info(f"Test DataFrame Size: {test_df.shape}")
+    main_logger.info(f"Test DataFrame Columns: {test_df.columns.tolist()}")
+
+    # Verify test_df integrity
+    if test_df.empty:
+        main_logger.critical("Test DataFrame is empty. Exiting.")
+        exit()
+        
+    # Save and log scaler information
     scaler_filename = RESULTS_DIR / 'scaler.pkl'
     joblib.dump(scaler, scaler_filename)
     main_logger.info(f"Scaler saved at {scaler_filename}")
+
+    # Define baseline_test_df as a copy of test_df for baseline strategies
+    baseline_test_df = test_df.copy()
+    main_logger.info("Copied test_df to baseline_test_df for baseline strategies evaluation.")
 
     check_env(SingleStockTradingEnv(
         df=train_df,
@@ -2003,6 +2153,10 @@ if __name__ == "__main__":
 
     # Hyperparameter tuning with Optuna
     log_phase("Hyperparameter Tuning", "Starting", {"total_trials": 10})
+    
+    # Optuna hyperparameter tuning with limited concurrent trials to prevent overload
+    main_logger.info("Starting hyperparameter tuning with Optuna...")
+    
     storage = optuna.storages.RDBStorage(
         url='sqlite:///optuna_study.db',
         engine_kwargs={'connect_args': {'check_same_thread': False}}
@@ -2084,15 +2238,16 @@ if __name__ == "__main__":
     callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
 
     start_time = time.time()
-    model.learn(total_timesteps=500000, callback=callback_list)
+    model.learn(total_timesteps=100000, callback=callback_list)
     duration = time.time() - start_time
-    log_phase("Main Training", "Completed", {"env_rank": main_env_rank, "total_timesteps": 500000}, duration)
+    log_phase("Main Training", "Completed", {"env_rank": main_env_rank, "total_timesteps": 100000}, duration)
 
     model_path = RESULTS_DIR / f"ppo_model_{TICKER}.zip"
     model.save(str(model_path))
     main_logger.info(f"Model saved at {model_path}")
 
     # Testing Phase
+        # Testing Phase
     log_phase("Testing Phase", "Starting", {"env_rank": 999, "data_points": len(test_df)})
     test_env_rank = 999
     env_test = SingleStockTradingEnv(
@@ -2109,6 +2264,8 @@ if __name__ == "__main__":
         reward_weights={'reward_scale': 1.0}
     )
     env_test.seed(RANDOM_SEED + test_env_rank)
+    main_logger.info(f"Initialized SingleStockTradingEnv with env_rank={test_env_rank} for testing.")
+    
     obs, info = env_test.reset()
     done = False
     steps_taken = 0
@@ -2126,6 +2283,60 @@ if __name__ == "__main__":
     if rl_test_df.empty:
         main_logger.error("No RL test history collected.")
 
+    # Ensure 'Reward' column exists
+    if 'Reward' not in rl_test_df.columns:
+        rl_test_df['Reward'] = 0.0
+        main_logger.critical("'Reward' column not found in RL test history. Defaulting rewards to 0.")
+
+    # Initialize default performance metrics to avoid NameError
+    test_final_net_worth = INITIAL_BALANCE
+    test_profit = 0.0
+    test_max_dd = 0.0
+    test_annualized_return = 0.0
+
+    # Calculate Performance Metrics for Testing
+        # Calculate Performance Metrics for Testing
+    if not rl_test_df.empty:
+        if 'Net Worth' in rl_test_df.columns:
+            test_final_net_worth = float(rl_test_df['Net Worth'].iloc[-1])
+        elif 'net worth' in rl_test_df.columns:
+            test_final_net_worth = float(rl_test_df['net worth'].iloc[-1])
+        else:
+            main_logger.error("Neither 'Net Worth' nor 'net worth' found in RL test history.")
+
+        test_profit = test_final_net_worth - INITIAL_BALANCE
+
+        if 'Net Worth' in rl_test_df.columns:
+            test_max_dd = calculate_max_drawdown(rl_test_df['Net Worth'])
+            test_annualized_return = calculate_annualized_return(rl_test_df['Net Worth'])
+        elif 'net worth' in rl_test_df.columns:
+            test_max_dd = calculate_max_drawdown(rl_test_df['net worth'])
+            test_annualized_return = calculate_annualized_return(rl_test_df['net worth'])
+    else:
+        main_logger.error("RL test history is empty; using default performance metrics.")
+
+    # Calculate Transaction Costs and Counts
+    rl_transaction_cost = 0.0
+    rl_transaction_count = 0
+    if not rl_test_df.empty:
+        if 'Trade_Cost' in rl_test_df.columns:
+            rl_transaction_cost = rl_test_df['Trade_Cost'].sum()
+        if 'Action' in rl_test_df.columns:
+            num_buys = (rl_test_df['Action'] > 0).sum()
+            num_sells = (rl_test_df['Action'] < 0).sum()
+            rl_transaction_count = num_buys + num_sells
+
+    # Log and print RL Agent Results on Test Data
+    main_logger.critical("RL Agent Performance on Test Data:")
+    main_logger.critical(f"  Final Net Worth: ${test_final_net_worth:.2f}")
+    main_logger.critical(f"  Profit: ${test_profit:.2f}")
+    main_logger.critical(f"  Annualized Return: {test_annualized_return*100:.2f}%")
+    main_logger.critical(f"  Max Drawdown: {test_max_dd*100:.2f}%")
+    main_logger.critical(f"  Transaction Costs: ${rl_transaction_cost:.2f}")
+    main_logger.critical(f"  Transaction Count: {int(rl_transaction_count)}")
+    main_logger.critical("-" * 50)
+
+    
     ##############################################
     # Evaluate Baseline Strategies on Test Data
     ##############################################
