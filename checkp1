@@ -33,7 +33,7 @@ foreach ($cmdFile in $cmdFiles) {
     $content = Get-Content -Path $cmdFile.FullName
 
     # Find first invocation of .bat OR .cmd file (CALL, START, CMD /C, CMD /K)
-    $scriptMatches = [regex]::Matches($content -join "`n", "(?i)(call|start|cmd /c|cmd /k)?\s*[""']?([^""'\s]+\.bat|[^""'\s]+\.cmd)")
+    $scriptMatches = [regex]::Matches($content -join "`n", "(?i)(?:(call|start|cmd /c|cmd /k)\s*[""']?)?([^""'\s]+\.bat|[^""'\s]+\.cmd)(?:\s.*)?")
 
     $matchFound = $false
     $insertIndex = -1
