@@ -5,7 +5,7 @@ param (
     [string]$ScriptTypeFilter = "bat",  # "bat" = only match .bat, "cmd" = only match .cmd, "all" = match both
     [string]$IncludeKeyword = "", # If set, only processes .cmd files that contain this keyword in their filename
     [string]$ExcludeKeyword = "init",  # If set, excludes .cmd files containing this keyword in their filename
-    [string]$EnvBatchPath = "C:\Users\Ramic\OneDrive\Desktop\testcmd\Scripts\Utility"  # If set, inserts 'call <path>\%SERVERNAME%_ENV.bat'
+    [string]$EnvBatchPath = "C:\Users\Ramic\OneDrive\Desktop\testcmd\Scripts\Utility"  # If set, inserts 'call <path>\%CURRENTSERVER%_ENV.bat'
 )
 
 # Ensure Destination Folder exists
@@ -89,10 +89,10 @@ foreach ($cmdFile in $cmdFiles) {
             # Insert batch-compatible code dynamically
             $newLines = @("whoami")
 
-            # Insert 'call <path>\%SERVERNAME%_ENV.bat' only if $EnvBatchPath is set
+            # Insert 'call <path>\%CURRENTSERVER%_ENV.bat' only if $EnvBatchPath is set
             if ($EnvBatchPath -ne "") {
-                $newLines += "for /f `"delims=. `" %%A in ('echo %COMPUTERNAME%') do set SERVERNAME=%%A"
-                $newLines += "call $EnvBatchPath\%SERVERNAME%_ENV.bat"
+                $newLines += "for /f `"delims=. `" %%A in ('echo %COMPUTERNAME%') do set CURRENTSERVER=%%A"
+                $newLines += "call $EnvBatchPath\%CURRENTSERVER%_ENV.bat"
             }
 
             # Insert the new lines before the first script call
