@@ -1,109 +1,177 @@
 param (
     [string]$SourceFolder = "C:\Users\Ramic\OneDrive\Desktop\testcmd\SourceFolder",
     [string]$DestinationFolder = "C:\Users\Ramic\OneDrive\Desktop\testcmd\DestinationFolder",
-    [string]$BatPathFilter = "",  # If set, only copy .cmd files referencing .bat files matching this keyword
-    [string]$ScriptTypeFilter = "bat",  # "bat" = only match .bat, "cmd" = only match .cmd, "all" = match both
-    [string]$IncludeKeyword = "", # If set, only processes .cmd files that contain this keyword in their filename
-    [string]$ExcludeKeyword = "init",  # If set, excludes .cmd files containing this keyword in their filename
-    [string]$EnvBatchPath = "C:\Users\Ramic\OneDrive\Desktop\testcmd\Scripts\Utility"  # If set, inserts 'call <path>\%CURRENTSERVER%_ENV.bat'
+    [string]$BatPathFilter = "",  # If set, only copy .cmd files referencing .bat files containing this keyword in their full path
+    [string]$IncludeKeyword = "", # If set, only process .cmd files that contain this keyword in their filename
+    [string]$ExcludeKeyword = "init",  # If set, exclude .cmd files containing this keyword in their filename
+    [string]$EnvBatchPath = "C:\Users\Ramic\OneDrive\Desktop\testcmd\Scripts\Utility"  # If set, inserts 'call <path>\%COMPUTERNAME%_ENV.bat'
 )
 
-# Ensure Destination Folder exists
-if (!(Test-Path -Path $DestinationFolder)) {
-    New-Item -ItemType Directory -Path $DestinationFolder | Out-Null
+# --------------------------------------------
+# Function to log messages with different colors
+function Log-Message {
+    param (
+        [string]$Message,
+        [string]$Color = "White"
+    )
+    Write-Host $Message -ForegroundColor $Color
 }
 
-# Get all .cmd files
-$cmdFiles = Get-ChildItem -Path $SourceFolder -Filter "*.cmd" -File
+# --------------------------------------------
+# Ensure Destination Folder exists
+if (!(Test-Path -Path $DestinationFolder)) {
+    try {
+        New-Item -ItemType Directory -Path $DestinationFolder -Force | Out-Null
+        Log-Message "Created Destination Folder: $DestinationFolder" -Color Green
+    } catch {
+        Log-Message "Failed to create Destination Folder: $DestinationFolder" -Color Red
+        exit 1
+    }
+} else {
+    Log-Message "Destination Folder exists: $DestinationFolder" -Color Green
+}
 
+# --------------------------------------------
+# Get all .cmd files from SourceFolder
+try {
+    $cmdFiles = Get-ChildItem -Path $SourceFolder -Filter "*.cmd" -File
+    Log-Message "Found $($cmdFiles.Count) .cmd files in Source Folder." -Color Green
+} catch {
+    Log-Message "Error accessing Source Folder: $SourceFolder" -Color Red
+    exit 1
+}
+
+# --------------------------------------------
+# Process each .cmd file
 foreach ($cmdFile in $cmdFiles) {
+    Log-Message "Processing file: $($cmdFile.FullName)" -Color Cyan
+    
     # Apply IncludeKeyword filter (if set)
     if ($IncludeKeyword -ne "" -and $cmdFile.Name -notlike "*$IncludeKeyword*") {
-        Write-Host "Skipping (does not match include keyword '$IncludeKeyword'): $($cmdFile.Name)" -ForegroundColor Cyan
+        Log-Message "Skipping (does not match include keyword '$IncludeKeyword'): $($cmdFile.Name)" -Color Yellow
         continue
     }
 
     # Apply ExcludeKeyword filter (if set)
     if ($ExcludeKeyword -ne "" -and $cmdFile.Name -like "*$ExcludeKeyword*") {
-        Write-Host "Skipping (matches exclude keyword '$ExcludeKeyword'): $($cmdFile.Name)" -ForegroundColor Yellow
+        Log-Message "Skipping (matches exclude keyword '$ExcludeKeyword'): $($cmdFile.Name)" -Color Yellow
         continue
     }
 
-    # Read file content
-    $content = Get-Content -Path $cmdFile.FullName
+    # Read file content as array of lines
+    try {
+        $content = Get-Content -Path $cmdFile.FullName -ErrorAction Stop
+        Log-Message "Read $($content.Length) lines from $($cmdFile.Name)." -Color Green
+    } catch {
+        Log-Message "Failed to read file: $($cmdFile.FullName)" -Color Red
+        continue
+    }
 
-    # Find first invocation of .bat OR .cmd file (CALL, START, CMD /C, CMD /K)
-    $scriptMatches = [regex]::Matches($content -join "`n", "(?i)(?:(call|start|cmd /c|cmd /k)\s*[""']?)?([^""'\s]+\.bat|[^""'\s]+\.cmd)(?:\s.*)?")
-
+    # Initialize variables for insertion
     $matchFound = $false
     $insertIndex = -1
 
-    foreach ($match in $scriptMatches) {
-        $scriptPath = $match.Groups[2].Value.Trim()  # Extract and clean the script path
+    # Iterate through each line to find the first .bat file reference
+    for ($i = 0; $i -lt $content.Length; $i++) {
+        $line = $content[$i]
+        Log-Message "Examining line $($i + 1): $line" -Color Gray
 
-        # Ignore empty or invalid paths
-        if ([string]::IsNullOrWhiteSpace($scriptPath)) { continue }
+        # Regex to match .bat file references
+        # Matches lines with optional 'call', 'start', 'cmd /c', 'cmd /k' followed by a path to a .bat file
+        # Handles quoted and unquoted paths, with or without arguments
+        $regex = @'
+^(?i)\s*(?:call\s+|start\s+|cmd\s+/c\s+|cmd\s+/k\s+)?["']?([^\s"']+\.bat)["']?.*$
+'@
 
-        # Remove quotes
-        $scriptPath = $scriptPath -replace '["'']', ''
+        $match = [regex]::Match($line, $regex)
 
-        # Convert relative paths to full paths
-        if (-not [System.IO.Path]::IsPathRooted($scriptPath)) {
-            $scriptPath = [System.IO.Path]::Combine($SourceFolder, $scriptPath)
+        if ($match.Success) {
+            $batFilePath = $match.Groups[1].Value.Trim()
+            Log-Message "Extracted .bat path: $batFilePath" -Color Cyan
+
+            # Skip if path contains illegal characters
+            if ($batFilePath -match '[<>:"|?*]') {
+                Log-Message "Skipping invalid path due to illegal characters: $batFilePath" -Color Yellow
+                continue
+            }
+
+            # Convert to full path if relative
+            if (-not [System.IO.Path]::IsPathRooted($batFilePath)) {
+                $batFilePath = Join-Path -Path $SourceFolder -ChildPath $batFilePath
+                Log-Message "Converted to full path: $batFilePath" -Color Cyan
+            }
+
+            # Normalize the path
+            try {
+                $batFilePath = [System.IO.Path]::GetFullPath($batFilePath)
+                Log-Message "Normalized .bat path: $batFilePath" -Color Cyan
+            } catch {
+                Log-Message "Skipping invalid path (GetFullPath failed): $batFilePath" -Color Yellow
+                continue
+            }
+
+            # Apply BatPathFilter (if set)
+            if ($BatPathFilter -ne "") {
+                if ($batFilePath -like "*$BatPathFilter*") {
+                    Log-Message "BatPathFilter matched: $batFilePath" -Color Green
+                    $matchFound = $true
+                    $insertIndex = $i
+                    break
+                } else {
+                    Log-Message "BatPathFilter did not match: $batFilePath" -Color Magenta
+                    continue
+                }
+            } else {
+                # If no BatPathFilter, any .bat reference is acceptable
+                Log-Message "Found .bat reference without BatPathFilter: $batFilePath" -Color Green
+                $matchFound = $true
+                $insertIndex = $i
+                break
+            }
+        }
+    }
+
+    # If a matching .bat reference is found, proceed to modify and copy
+    if ($matchFound -and $insertIndex -ge 0) {
+        Log-Message "Inserting lines before line $($insertIndex + 1)." -Color Green
+
+        # Prepare the lines to insert
+        $newLines = @("whoami")
+        
+        if ($EnvBatchPath -ne "") {
+            # Ensure EnvBatchPath does not end with a backslash
+            $EnvBatchPath = $EnvBatchPath.TrimEnd('\')
+            $envCallLine = "call `"$EnvBatchPath\%COMPUTERNAME%_ENV.bat`""
+            $newLines += $envCallLine
+            Log-Message "Prepared insertion line: $envCallLine" -Color Cyan
         }
 
-        # Normalize path (for consistency)
-        $scriptPath = [System.IO.Path]::GetFullPath($scriptPath)
+        # Insert the new lines before the first .bat invocation
+        if ($insertIndex -eq 0) {
+            # If the first line is the .bat invocation, prepend the new lines
+            $modifiedContent = $newLines + $content
+        } else {
+            $modifiedContent = $content[0..($insertIndex - 1)] + $newLines + $content[$insertIndex..($content.Length - 1)]
+        }
 
-        # Debugging: Log detected paths
-        Write-Host "Checking referenced script file: $scriptPath"
+        # Define destination file path
+        $destFilePath = Join-Path -Path $DestinationFolder -ChildPath $cmdFile.Name
 
-        # Apply ScriptTypeFilter ("bat", "cmd", or "all")
-        $isBatFile = $scriptPath -match "\.bat$"
-        $isCmdFile = $scriptPath -match "\.cmd$"
-
-        if (($ScriptTypeFilter -eq "bat" -and -not $isBatFile) -or ($ScriptTypeFilter -eq "cmd" -and -not $isCmdFile)) {
-            Write-Host "Skipping script reference due to ScriptTypeFilter ('$ScriptTypeFilter'): $scriptPath" -ForegroundColor Magenta
+        # Write the modified content to the destination file
+        try {
+            Set-Content -Path $destFilePath -Value $modifiedContent -Encoding UTF8 -Force
+            Log-Message "Copied and modified: $($cmdFile.FullName) -> $destFilePath" -Color Green
+        } catch {
+            Log-Message "Failed to write to destination file: $destFilePath" -Color Red
             continue
         }
-
-        # Apply BatPathFilter (only if referencing a .bat file)
-        if ($BatPathFilter -ne "") {
-            if ($isBatFile -and $scriptPath -like "*$BatPathFilter*") {
-                Write-Host "Match found in: $($cmdFile.FullName) => Calls: $scriptPath"
-                $matchFound = $true
-                $insertIndex = [array]::IndexOf($content, $match.Value)  # Get the index of the first match
-                break  # Stop checking further if at least one match is found
-            }
-        } else {
-            Write-Host "Match found in: $($cmdFile.FullName) => Calls: $scriptPath"
-            $matchFound = $true
-            $insertIndex = [array]::IndexOf($content, $match.Value)
-            break
-        }
+    } else {
+        Log-Message "No matching .bat reference found or does not meet BatPathFilter: $($cmdFile.FullName)" -Color Gray
     }
 
-    # Copy and modify the .cmd file if it references a matching .bat/.cmd file
-    if ($matchFound) {
-        if ($insertIndex -ge 0) {
-            # Insert batch-compatible code dynamically
-            $newLines = @("whoami")
-
-            # Insert 'call <path>\%CURRENTSERVER%_ENV.bat' only if $EnvBatchPath is set
-            if ($EnvBatchPath -ne "") {
-                $newLines += "for /f `"delims=. `" %%A in ('echo %COMPUTERNAME%') do set CURRENTSERVER=%%A"
-                $newLines += "call $EnvBatchPath\%CURRENTSERVER%_ENV.bat"
-            }
-
-            # Insert the new lines before the first script call
-            $content = $content[0..($insertIndex-1)] + $newLines + $content[$insertIndex..($content.Length-1)]
-        }
-
-        # Save modified .cmd file to DestinationFolder
-        $destFilePath = Join-Path -Path $DestinationFolder -ChildPath $cmdFile.Name
-        $content | Set-Content -Path $destFilePath -Encoding UTF8
-        Write-Host "Copied and modified: $($cmdFile.FullName) -> $destFilePath"
-    }
+    # Separator for readability
+    Log-Message "----------------------------------------" -Color DarkGray
 }
 
-Write-Host "Processing Complete!"
+# --------------------------------------------
+Log-Message "Processing Complete!" -Color Cyan
