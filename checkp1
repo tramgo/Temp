@@ -1,0 +1,46 @@
+param (
+    [string]$SourceFolder = "C:\SourceFolder",
+    [string]$DestinationFolder = "C:\DestinationFolder",
+    [string]$BatPathFilter = ""  # Example: "C:\Scripts\Utility" to filter only those referencing this path
+)
+
+# Ensure Destination Folder exists
+if (!(Test-Path -Path $DestinationFolder)) {
+    New-Item -ItemType Directory -Path $DestinationFolder | Out-Null
+}
+
+# Get all .cmd files
+$cmdFiles = Get-ChildItem -Path $SourceFolder -Filter "*.cmd" -File
+
+foreach ($cmdFile in $cmdFiles) {
+    # Read file content
+    $content = Get-Content -Path $cmdFile.FullName -Raw
+
+    # Find lines that reference a .bat file (CALL, START, or direct execution)
+    $batMatches = [regex]::Matches($content, "(?i)(call|start|cmd /c|cmd /k)?\s*([`"\']?)([^`"\']+\.bat)\2")
+
+    $matchFound = $false
+
+    foreach ($match in $batMatches) {
+        $batFilePath = $match.Groups[3].Value  # Extract the .bat path
+
+        # Convert to full path if relative
+        if (!(Test-Path $batFilePath)) {
+            $batFilePath = [System.IO.Path]::Combine($SourceFolder, $batFilePath)
+        }
+
+        # Check if it matches the filter (if provided)
+        if ($BatPathFilter -eq "" -or $batFilePath -like "*$BatPathFilter*") {
+            $matchFound = $true
+            break  # No need to check further if at least one match is found
+        }
+    }
+
+    # Copy the .cmd file if a match is found
+    if ($matchFound) {
+        Copy-Item -Path $cmdFile.FullName -Destination $DestinationFolder -Force
+        Write-Host "Copied: $($cmdFile.FullName)"
+    }
+}
+
+Write-Host "Processing Complete!"
