@@ -1,0 +1,48 @@
+# Extract environment-related hyperparameters from best_params
+env_params = {
+    'df': train_df,
+    'scaler': scaler,
+    'initial_balance': INITIAL_BALANCE,
+    'stop_loss': best_params.get('stop_loss', STOP_LOSS),
+    'take_profit': best_params.get('take_profit', TAKE_PROFIT),
+    'max_position_size': best_params.get('max_position_size', MAX_POSITION_SIZE),
+    'max_drawdown': best_params.get('max_drawdown', MAX_DRAWDOWN),
+    'annual_trading_days': ANNUAL_TRADING_DAYS,
+    'transaction_cost': best_params.get('transaction_cost', TRANSACTION_COST),
+    'reward_weights': {
+        'reward_scale': best_params.get('reward_scale', 1.0),
+        'profit_weight': best_params.get('profit_weight', 1.0),
+        'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
+        'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
+        'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
+        'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
+        'volatility_threshold': best_params.get('volatility_threshold', 1.0),
+        'momentum_threshold_min': best_params.get('momentum_threshold_min', 30.0),
+        'momentum_threshold_max': best_params.get('momentum_threshold_max', 70.0)
+    }
+}
+
+
+env_test = SingleStockTradingEnv(
+    df=test_df,
+    scaler=scaler,
+    initial_balance=INITIAL_BALANCE,
+    stop_loss=best_params.get('stop_loss', STOP_LOSS),
+    take_profit=best_params.get('take_profit', TAKE_PROFIT),
+    max_position_size=best_params.get('max_position_size', MAX_POSITION_SIZE),
+    max_drawdown=best_params.get('max_drawdown', MAX_DRAWDOWN),
+    annual_trading_days=ANNUAL_TRADING_DAYS,
+    transaction_cost=best_params.get('transaction_cost', TRANSACTION_COST),
+    env_rank=test_env_rank,
+    reward_weights={
+        'reward_scale': best_params.get('reward_scale', 1.0),
+        'profit_weight': best_params.get('profit_weight', 1.0),
+        'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
+        'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
+        'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
+        'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
+        'volatility_threshold': best_params.get('volatility_threshold', 1.0),
+        'momentum_threshold_min': best_params.get('momentum_threshold_min', 30.0),
+        'momentum_threshold_max': best_params.get('momentum_threshold_max', 70.0)
+    }
+)
