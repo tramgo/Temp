@@ -1,0 +1,192 @@
+# ===============================================
+# Script: Manage-ServicesFromList.ps1
+# Description: Reads a list of service display names from a text file and either starts or stops each service.
+#              Optionally sets the startup type for each service.
+# ===============================================
+
+<#
+.SYNOPSIS
+    Starts or stops a list of Windows services based on their display names provided in a text file.
+    Optionally, sets the startup type for each service.
+
+.DESCRIPTION
+    This script allows you to manage multiple Windows services by reading their display names from a specified text file.
+    You can choose to either start or stop the services and optionally set their startup types to Automatic, Manual, or Disabled.
+
+.PARAMETER Action
+    Specifies the action to perform on the services. Acceptable values are 'Start' or 'Stop'.
+
+.PARAMETER ServiceListPath
+    The full path to the text file containing the list of service display names.
+
+.PARAMETER StartupType
+    (Optional) Sets the startup type for each service. Acceptable values are 'Automatic', 'Manual', or 'Disabled'.
+
+.EXAMPLE
+    .\Manage-ServicesFromList.ps1 -Action Start -ServiceListPath "C:\Path\To\services.txt"
+
+.EXAMPLE
+    .\Manage-ServicesFromList.ps1 -Action Stop -ServiceListPath "C:\Path\To\services.txt" -StartupType Disabled
+
+.NOTES
+    - Ensure you run this script with administrative privileges.
+    - The services.txt file should contain one service display name per line.
+    - Lines starting with '#' are treated as comments and ignored.
+#>
+
+# ---------------------------
+# Parameter Definitions
+# ---------------------------
+
+param (
+    [Parameter(Mandatory = $true, HelpMessage = "Specify the action to perform: 'Start' or 'Stop'.")]
+    [ValidateSet("Start", "Stop", IgnoreCase = $true)]
+    [string]$Action,
+
+    [Parameter(Mandatory = $true, HelpMessage = "Full path to the text file containing service display names.")]
+    [ValidateScript({ Test-Path $_ })]
+    [string]$ServiceListPath,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Optional. Set the startup type for the services: 'Automatic', 'Manual', or 'Disabled'.")]
+    [ValidateSet("Automatic", "Manual", "Disabled", IgnoreCase = $true)]
+    [string]$StartupType
+)
+
+# ---------------------------
+# Check for Administrative Privileges
+# ---------------------------
+
+$currentUser = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $currentUser.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error "You must run this script as an administrator. Exiting."
+    exit 1
+}
+
+# ---------------------------
+# Function Definitions
+# ---------------------------
+
+function Stop-ServiceByDisplayName {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName
+    )
+
+    # Retrieve the service object using the display name (case-insensitive)
+    $service = Get-Service | Where-Object { $_.DisplayName -ieq $DisplayName }
+
+    if (-not $service) {
+        Write-Warning "Service with display name '$DisplayName' not found."
+        return
+    }
+
+    try {
+        if ($service.Status -eq 'Running') {
+            Write-Host "Stopping service: $DisplayName" -ForegroundColor Cyan
+            Stop-Service -InputObject $service -Force -ErrorAction Stop
+            Write-Host "Service '$DisplayName' stopped successfully." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Service '$DisplayName' is not running." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Error "Failed to stop service '$DisplayName'. Error: $_"
+        # Log the error to a file
+        $_ | Out-File -FilePath "C:\Ramgo\pscript\error_log.txt" -Append
+    }
+}
+
+function Start-ServiceByDisplayName {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName
+    )
+
+    # Retrieve the service object using the display name (case-insensitive)
+    $service = Get-Service | Where-Object { $_.DisplayName -ieq $DisplayName }
+
+    if (-not $service) {
+        Write-Warning "Service with display name '$DisplayName' not found."
+        return
+    }
+
+    try {
+        if ($service.Status -ne 'Running') {
+            Write-Host "Starting service: $DisplayName" -ForegroundColor Cyan
+            Start-Service -InputObject $service -ErrorAction Stop
+            Write-Host "Service '$DisplayName' started successfully." -ForegroundColor Green
+        }
+        else {
+            Write-Host "Service '$DisplayName' is already running." -ForegroundColor Yellow
+        }
+    }
+    catch {
+        Write-Error "Failed to start service '$DisplayName'. Error: $_"
+        # Log the error to a file
+        $_ | Out-File -FilePath "C:\Ramgo\pscript\error_log.txt" -Append
+    }
+}
+
+function Set-ServiceStartupType {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Automatic", "Manual", "Disabled", IgnoreCase = $true)]
+        [string]$StartupType
+    )
+
+    try {
+        Write-Host "Setting startup type for '$DisplayName' to '$StartupType'." -ForegroundColor Magenta
+        Set-Service -DisplayName $DisplayName -StartupType $StartupType -ErrorAction Stop
+        Write-Host "Startup type for '$DisplayName' set to '$StartupType' successfully." -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to set startup type for '$DisplayName'. Error: $_"
+        # Log the error to a file
+        $_ | Out-File -FilePath "C:\Ramgo\pscript\error_log.txt" -Append
+    }
+}
+
+# ---------------------------
+# Main Script Execution
+# ---------------------------
+
+# Check if the service list file exists (Already validated by [ValidateScript], but redundant check removed)
+
+# Read the service display names from the file
+$serviceDisplayNames = Get-Content -Path $ServiceListPath
+
+# Process each service display name
+foreach ($displayName in $serviceDisplayNames) {
+    # Remove any leading/trailing whitespace
+    $displayName = $displayName.Trim()
+
+    # Skip empty lines or lines starting with a comment symbol (#)
+    if ([string]::IsNullOrEmpty($displayName) -or $displayName.StartsWith("#")) {
+        continue
+    }
+
+    switch ($Action.ToLower()) {
+        'stop' {
+            Stop-ServiceByDisplayName -DisplayName $displayName
+        }
+        'start' {
+            Start-ServiceByDisplayName -DisplayName $displayName
+        }
+        default {
+            Write-Error "Invalid action specified: '$Action'. Please use 'Start' or 'Stop'."
+        }
+    }
+
+    # If StartupType is provided, set it
+    if ($PSBoundParameters.ContainsKey('StartupType')) {
+        Set-ServiceStartupType -DisplayName $displayName -StartupType $StartupType
+    }
+}
+
+# ---------------------------------
+# End of Script
+# ---------------------------------
