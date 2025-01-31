@@ -1,76 +1,85 @@
-# 1) normal step logic: net_worth, net_worth_change, etc...
-# 2) standard profit reward, forced_stop, transaction penalty, etc...
-reward += profit_reward + forced_stop_penalty + ...
+def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
+    # 1) Standard check for action, end-of-data, buy/sell logic, etc...
+    # net_worth, net_worth_change
 
-# 3) LAYERED DRAWDOWN LOGIC with partial/full forced liquidation
-self.peak = max(self.peak, net_worth)
-if self.peak > 0:
-    current_drawdown = (self.peak - net_worth) / self.peak
-else:
-    current_drawdown = 0.0
+    # 2) Basic profit reward
+    profit_weight = self.reward_weights.get('profit_weight', 1.5)
+    profit_reward = (net_worth_change / self.initial_balance) * profit_weight
+    reward = profit_reward
 
-layered_penalty = 0.0
-if self.position > 0 and current_drawdown > 0:
-    # (A) Minor threshold at 1% drawdown
-    if current_drawdown > 0.01:
-        # Subtract a base penalty (2.0) plus 1% * peak * factor
-        layered_penalty -= (2.0 + 0.01 * self.peak * self.some_factor)
+    # 3) forced_stop, transaction_penalty, sharpe_bonus, etc...
+    # e.g. reward += forced_stop_penalty + transaction_penalty + sharpe_bonus
 
-    # (B) If drawdown > 2% => multiply penalty by 1.25
-    if current_drawdown > 0.02:
-        layered_penalty = -abs(layered_penalty) * 1.25
+    # (A) measure a "typical step magnitude"
+    # Suppose we keep a rolling returns_window or net_worth_changes
+    # Example: store net_worth_change each step
+    self.networth_change_buffer.append(net_worth_change)  # add to a deque
+    if len(self.networth_change_buffer) > 500:
+        self.networth_change_buffer.popleft()
 
-    # (C) If drawdown > 3% => partial forced liquidation + multiply again
-    if current_drawdown > 0.03:
-        shares_to_sell = math.floor(self.position * 0.5)
-        if shares_to_sell > 0:
-            proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-            self.balance += proceeds
-            self.position -= shares_to_sell
-            self.training_logger.info(
-                f"[Env {self.env_rank}] Partial forced liquidation at ~3% drawdown. "
-                f"Selling {shares_to_sell} shares..."
-            )
-        # multiply penalty by 1.25 again
-        layered_penalty = -abs(layered_penalty) * 1.25
+    # If we have enough data, compute average
+    typical_step = 0.0
+    if len(self.networth_change_buffer) >= 20:
+        # average absolute networth change
+        avg_abs_change = np.mean([abs(x) for x in self.networth_change_buffer])
+        # scale it up to a "reward range" by multipying by some factor, or keep it raw
+        typical_step = avg_abs_change  # e.g. typical net worth change
 
-    # (D) If drawdown > 5% => full forced liquidation + multiply once more
-    if current_drawdown > 0.05:
-        shares_to_sell = self.position
-        if shares_to_sell > 0:
-            proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-            self.balance += proceeds
-            self.position = 0
-            self.training_logger.info(
-                f"[Env {self.env_rank}] Full forced liquidation at ~5% drawdown."
-            )
-        # multiply penalty by 1.25 again
-        layered_penalty = -abs(layered_penalty) * 1.25
+    # If typical_step is near zero, fallback
+    if typical_step < 1e-6:
+        typical_step = 1.0  # ensures we don't get weird results
 
-# Finally add the layered penalty to the reward
-reward += layered_penalty
+    # 4) Drawdown logic
+    self.peak = max(self.peak, net_worth)
+    if self.peak > 0:
+        current_drawdown = (self.peak - net_worth) / self.peak
+    else:
+        current_drawdown = 0.0
 
- # 11) Accumulate final raw_reward
-    raw_reward = reward
+    layered_penalty = 0.0
+    # Only if we have a position and are actually exposed
+    if self.position > 0 and current_drawdown > 0:
+        # (B) Smaller threshold => penalty ~1.5 * typical
+        if current_drawdown > 0.01:  # 1% dd
+            layered_penalty -= 1.5 * typical_step
 
-    # 12) DYNAMIC SCALING WITH ROLLING STD
+        # 2% => penalty ~2.0 * typical
+        if current_drawdown > 0.02:
+            layered_penalty -= 2.0 * typical_step
+
+        # 3% => partial liquidation + penalty ~2.5 * typical
+        if current_drawdown > 0.03:
+            shares_to_sell = math.floor(self.position * 0.5)
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.balance += proceeds
+                self.position -= shares_to_sell
+            layered_penalty -= 2.5 * typical_step
+
+        # 5% => full liquidation + penalty ~3.0 * typical
+        if current_drawdown > 0.05:
+            shares_to_sell = self.position
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.balance += proceeds
+                self.position = 0
+            layered_penalty -= 3.0 * typical_step
+
+    reward += layered_penalty
+
+    # (C) Now do your dynamic scaling / np.tanh if desired
     if not hasattr(self, 'reward_history'):
-        import collections
         self.reward_history = collections.deque(maxlen=500)
+    self.reward_history.append(reward)
 
-    self.reward_history.append(raw_reward)
-
-    # after we have enough steps, compute local std
     if len(self.reward_history) >= 50:
         local_std = np.std(self.reward_history)
         if local_std < 1e-6:
             local_std = 1.0
-        scale_factor = 2.0 * local_std  # e.g. 2 x std
-        scaled_reward = np.tanh(raw_reward / scale_factor)
+        scale_factor = 2.0 * local_std
+        scaled_reward = np.tanh(reward / scale_factor)
     else:
-        scaled_reward = raw_reward
+        scaled_reward = reward
 
-    # Additional global scale from 'reward_scale'
-    scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
-
-    normalized_reward = scaled_reward
+    # rest of step => store in history, increment step, etc...
+    return obs, scaled_reward, terminated, truncated, {}
