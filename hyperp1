@@ -49,3 +49,28 @@ if self.position > 0 and current_drawdown > 0:
 
 # Finally add the layered penalty to the reward
 reward += layered_penalty
+
+ # 11) Accumulate final raw_reward
+    raw_reward = reward
+
+    # 12) DYNAMIC SCALING WITH ROLLING STD
+    if not hasattr(self, 'reward_history'):
+        import collections
+        self.reward_history = collections.deque(maxlen=500)
+
+    self.reward_history.append(raw_reward)
+
+    # after we have enough steps, compute local std
+    if len(self.reward_history) >= 50:
+        local_std = np.std(self.reward_history)
+        if local_std < 1e-6:
+            local_std = 1.0
+        scale_factor = 2.0 * local_std  # e.g. 2 x std
+        scaled_reward = np.tanh(raw_reward / scale_factor)
+    else:
+        scaled_reward = raw_reward
+
+    # Additional global scale from 'reward_scale'
+    scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
+
+    normalized_reward = scaled_reward
