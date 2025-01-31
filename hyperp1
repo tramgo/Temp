@@ -1,48 +1,51 @@
-# Extract environment-related hyperparameters from best_params
-env_params = {
-    'df': train_df,
-    'scaler': scaler,
-    'initial_balance': INITIAL_BALANCE,
-    'stop_loss': best_params.get('stop_loss', STOP_LOSS),
-    'take_profit': best_params.get('take_profit', TAKE_PROFIT),
-    'max_position_size': best_params.get('max_position_size', MAX_POSITION_SIZE),
-    'max_drawdown': best_params.get('max_drawdown', MAX_DRAWDOWN),
-    'annual_trading_days': ANNUAL_TRADING_DAYS,
-    'transaction_cost': best_params.get('transaction_cost', TRANSACTION_COST),
-    'reward_weights': {
-        'reward_scale': best_params.get('reward_scale', 1.0),
-        'profit_weight': best_params.get('profit_weight', 1.0),
-        'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
-        'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
-        'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
-        'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
-        'volatility_threshold': best_params.get('volatility_threshold', 1.0),
-        'momentum_threshold_min': best_params.get('momentum_threshold_min', 30.0),
-        'momentum_threshold_max': best_params.get('momentum_threshold_max', 70.0)
-    }
-}
+# 1) normal step logic: net_worth, net_worth_change, etc...
+# 2) standard profit reward, forced_stop, transaction penalty, etc...
+reward += profit_reward + forced_stop_penalty + ...
 
+# 3) LAYERED DRAWDOWN LOGIC with partial/full forced liquidation
+self.peak = max(self.peak, net_worth)
+if self.peak > 0:
+    current_drawdown = (self.peak - net_worth) / self.peak
+else:
+    current_drawdown = 0.0
 
-env_test = SingleStockTradingEnv(
-    df=test_df,
-    scaler=scaler,
-    initial_balance=INITIAL_BALANCE,
-    stop_loss=best_params.get('stop_loss', STOP_LOSS),
-    take_profit=best_params.get('take_profit', TAKE_PROFIT),
-    max_position_size=best_params.get('max_position_size', MAX_POSITION_SIZE),
-    max_drawdown=best_params.get('max_drawdown', MAX_DRAWDOWN),
-    annual_trading_days=ANNUAL_TRADING_DAYS,
-    transaction_cost=best_params.get('transaction_cost', TRANSACTION_COST),
-    env_rank=test_env_rank,
-    reward_weights={
-        'reward_scale': best_params.get('reward_scale', 1.0),
-        'profit_weight': best_params.get('profit_weight', 1.0),
-        'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
-        'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
-        'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
-        'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
-        'volatility_threshold': best_params.get('volatility_threshold', 1.0),
-        'momentum_threshold_min': best_params.get('momentum_threshold_min', 30.0),
-        'momentum_threshold_max': best_params.get('momentum_threshold_max', 70.0)
-    }
-)
+layered_penalty = 0.0
+if self.position > 0 and current_drawdown > 0:
+    # (A) Minor threshold at 1% drawdown
+    if current_drawdown > 0.01:
+        # Subtract a base penalty (2.0) plus 1% * peak * factor
+        layered_penalty -= (2.0 + 0.01 * self.peak * self.some_factor)
+
+    # (B) If drawdown > 2% => multiply penalty by 1.25
+    if current_drawdown > 0.02:
+        layered_penalty = -abs(layered_penalty) * 1.25
+
+    # (C) If drawdown > 3% => partial forced liquidation + multiply again
+    if current_drawdown > 0.03:
+        shares_to_sell = math.floor(self.position * 0.5)
+        if shares_to_sell > 0:
+            proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+            self.balance += proceeds
+            self.position -= shares_to_sell
+            self.training_logger.info(
+                f"[Env {self.env_rank}] Partial forced liquidation at ~3% drawdown. "
+                f"Selling {shares_to_sell} shares..."
+            )
+        # multiply penalty by 1.25 again
+        layered_penalty = -abs(layered_penalty) * 1.25
+
+    # (D) If drawdown > 5% => full forced liquidation + multiply once more
+    if current_drawdown > 0.05:
+        shares_to_sell = self.position
+        if shares_to_sell > 0:
+            proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+            self.balance += proceeds
+            self.position = 0
+            self.training_logger.info(
+                f"[Env {self.env_rank}] Full forced liquidation at ~5% drawdown."
+            )
+        # multiply penalty by 1.25 again
+        layered_penalty = -abs(layered_penalty) * 1.25
+
+# Finally add the layered penalty to the reward
+reward += layered_penalty
