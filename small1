@@ -782,7 +782,7 @@ class SingleStockTradingEnv(gym.Env):
 
         self.history.append({
             'Date': current_date,
-            'Close unscaled': current_price,
+            'Close_unscaled': current_price,
             'Action': action_value,
             'Buy_Signal_Price': current_price if action_value > 0 else np.nan,
             'Sell_Signal_Price': current_price if action_value < 0 else np.nan,
@@ -816,7 +816,7 @@ class SingleStockTradingEnv(gym.Env):
         if self.current_step >= MIN_STEPS:
             if net_worth <= 0:
                 terminated = True
-                normalized_reward = -10.0
+                normalized_reward -= 10.0
                 training_logger.error(f"[Env {self.env_rank}] Bankruptcy occurred. Terminating episode at step {self.current_step}.")
             elif self.current_step >= len(self.df) - 1:
                 terminated = True
