@@ -673,51 +673,52 @@ class SingleStockTradingEnv(gym.Env):
         drawdown_excess = current_drawdown - self.max_drawdown
         drawdown_penalty = 0.0
         
-        if self.position > 0 and current_drawdown > 0:
-            # (A) Minor threshold at 5% drawdown
-            if current_drawdown > 0.1:
-                # Subtract a base penalty (2.0) plus 1% * peak * factor
-                drawdown_penalty -= (2.0 + self.initial_balance * self.some_factor)
+        # (A) Minor threshold at 5% drawdown
+        if current_drawdown > 0.05:
+            # Subtract a base penalty (2.0) plus 1% * peak * factor
+            drawdown_penalty -= (2.0 + self.initial_balance * self.some_factor)
 
-            # (B) If drawdown > 10% => multiply penalty by 1.25
-            if current_drawdown > 0.15:
-                drawdown_penalty = -abs(drawdown_penalty) * 1.25
+        # (B) If drawdown > 10% => multiply penalty by 1.25
+        if current_drawdown > 0.1:
+            drawdown_penalty = -abs(drawdown_penalty) * 1.25
 
-            # (C) If drawdown > 15% => partial forced liquidation + multiply again
-            if current_drawdown > 0.2:
-                shares_to_sell = math.floor(self.position * 0.5)
-                if shares_to_sell > 0:
-                    proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-                    self.balance += proceeds
-                    self.position -= shares_to_sell
-                    self.transaction_count += 1
-                    shares_traded = shares_to_sell
-                    trade_cost = shares_traded * current_price * self.transaction_cost
-                    self.peak = float(self.balance + self.position * current_price)
-                    training_logger.info(
-                        f"[Env {self.env_rank}] Partial forced liquidation at ~15% drawdown. "
-                        f"Selling {shares_to_sell} shares..."
-                    )
-                # Multiply penalty by 1.25 again
-                drawdown_penalty = -abs(drawdown_penalty) * 1.25
+        # (C) If drawdown > 15% => partial forced liquidation + multiply again
+        if current_drawdown > 0.15 and self.position > 0:
+            shares_to_sell = math.floor(self.position * 0.5)
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.balance += proceeds
+                self.position -= shares_to_sell
+                self.transaction_count += 1
+                shares_traded = shares_to_sell
+                trade_cost += shares_traded * current_price * self.transaction_cost
+                self.peak = float(self.balance + self.position * current_price)
+                training_logger.info(
+                    f"[Env {self.env_rank}] Partial forced liquidation at ~15% drawdown. "
+                    f"Selling {shares_to_sell} shares..."
+                )
 
-            # (D) If drawdown > 20% => full forced liquidation + multiply once more
-            if current_drawdown > 0.25:
-                shares_to_sell = self.position
-                if shares_to_sell > 0:
-                    proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
-                    self.balance += proceeds
-                    self.transaction_count += 1
-                    shares_traded = shares_to_sell
-                    trade_cost = shares_traded * current_price * self.transaction_cost
-                    self.position = 0
-                    self.peak = self.balance
-                    training_logger.info(
-                        f"[Env {self.env_rank}] Full forced liquidation at ~20% drawdown."
-                        f"Selling {shares_to_sell} shares..."
-                    )
-                # Multiply penalty by 1.25 again
-                drawdown_penalty = -abs(drawdown_penalty) * 1.25
+        # Multiply penalty by 1.25 again
+        drawdown_penalty = -abs(drawdown_penalty) * 1.25
+
+        # (D) If drawdown > 20% => full forced liquidation + multiply once more
+        if current_drawdown > 0.2 and self.position > 0:
+            shares_to_sell = self.position
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.balance += proceeds
+                self.transaction_count += 1
+                shares_traded = shares_to_sell
+                trade_cost += shares_traded * current_price * self.transaction_cost
+                self.position = 0
+                self.peak = self.balance
+                training_logger.info(
+                    f"[Env {self.env_rank}] Full forced liquidation at ~20% drawdown. "
+                    f"Selling {shares_to_sell} shares..."
+                )
+
+        # Multiply penalty by 1.25 again
+        drawdown_penalty = -abs(drawdown_penalty) * 1.25
                 
         net_worth = float(self.balance + self.position * current_price)
         self.net_worth = net_worth
