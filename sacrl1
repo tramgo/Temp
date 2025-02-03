@@ -1,162 +1,116 @@
-from stable_baselines3 import SAC
-from stable_baselines3.common.vec_env import DummyVecEnv
+# --- TD3 Model Initialization and Training ---
 
-def objective_sac(trial, df, scaler, initial_balance, stop_loss, take_profit, 
-                  max_position_size, max_drawdown, annual_trading_days, transaction_cost):
-    # Sample SAC-specific hyperparameters
-    learning_rate = trial.suggest_loguniform("sac_learning_rate", 1e-5, 1e-3)
-    batch_size = trial.suggest_categorical("sac_batch_size", [64, 128, 256])
-    tau = trial.suggest_uniform("sac_tau", 0.005, 0.05)
-    gamma = trial.suggest_uniform("sac_gamma", 0.95, 0.99)
-    ent_coef = trial.suggest_loguniform("sac_ent_coef", 1e-5, 1e-2)
-    
-    # Choose network architecture for SAC
-    net_arch_str = trial.suggest_categorical("sac_net_arch", ["128_128", "256_256", "128_256_128"])
-    policy_kwargs = dict(
-        activation_fn=torch.nn.ReLU,
-        net_arch=[int(x) for x in net_arch_str.split('_')]
-    )
-    
-    # Create the training environment using your existing environment
-    env_train = SingleStockTradingEnv(
-        df=df,
-        scaler=scaler,
-        initial_balance=initial_balance,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        max_position_size=max_position_size,
-        max_drawdown=max_drawdown,
-        annual_trading_days=annual_trading_days,
-        transaction_cost=transaction_cost,
-        env_rank=trial.number + 1,
-    )
-    env_train.seed(RANDOM_SEED + trial.number + 1)
-    vec_env_train = DummyVecEnv([lambda: env_train])
-    
-    # Initialize SAC with the chosen hyperparameters.
-    model = SAC(
-        "MlpPolicy",
-        vec_env_train,
-        policy_kwargs=policy_kwargs,
-        learning_rate=learning_rate,
-        batch_size=batch_size,
-        tau=tau,
-        gamma=gamma,
-        ent_coef=ent_coef,
-        verbose=0,
-        seed=RANDOM_SEED
-    )
-    
-    # Optionally, add callbacks similar to your PPO case.
-    checkpoint_callback = CheckpointCallback(
-        save_freq=50000,
-        save_path=str(RESULTS_DIR / f"checkpoints_sac_trial_{trial.number}"),
-        name_prefix="sac_model"
-    )
-    custom_callback = CustomTensorboardCallback()
-    early_stopping_callback = EarlyStoppingCallback(
-        monitor='train/reward_env',
-        patience=10000,
-        min_delta=1e-5,
-        verbose=1
-    )
-    callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
-    
-    start_time = time.time()
-    try:
-        model.learn(total_timesteps=100000, callback=callback_list)
-    except Exception as e:
-        main_logger.critical(f"[SAC Trial {trial.number}] Training failed: {e}")
-        return -np.inf
-    duration = time.time() - start_time
-    
-    # Evaluate cumulative reward from env history (similar to your PPO objective)
-    env_train_history = env_train.history
-    cumulative_reward = sum(entry.get('Reward', 0.0) for entry in env_train_history) if env_train_history else 0.0
-    
-    main_logger.critical(f"[SAC Trial {trial.number}] Cumulative Reward: {cumulative_reward:.4f}")
-    return cumulative_reward
-
-
-from stable_baselines3 import TD3
-from stable_baselines3.common.vec_env import DummyVecEnv
-
-def objective_td3(trial, df, scaler, initial_balance, stop_loss, take_profit, 
-                  max_position_size, max_drawdown, annual_trading_days, transaction_cost):
-    # Sample TD3‐specific hyperparameters
-    learning_rate = trial.suggest_loguniform("td3_learning_rate", 1e-5, 1e-3)
-    buffer_size = trial.suggest_categorical("td3_buffer_size", [100000, 500000, 1000000])
-    batch_size = trial.suggest_categorical("td3_batch_size", [32, 64, 128])
-    tau = trial.suggest_uniform("td3_tau", 0.005, 0.05)
-    gamma = trial.suggest_uniform("td3_gamma", 0.95, 0.99)
-    
-    # You can also choose different network architectures for TD3
-    net_arch_str = trial.suggest_categorical("td3_net_arch", ["128_128", "256_256", "128_256_128"])
-    policy_kwargs = dict(
-        activation_fn=torch.nn.ReLU,
-        net_arch=[int(x) for x in net_arch_str.split('_')]
-    )
-    
-    # Create the training environment using your existing environment
-    env_train = SingleStockTradingEnv(
-        df=df,
-        scaler=scaler,
-        initial_balance=initial_balance,
-        stop_loss=stop_loss,
-        take_profit=take_profit,
-        max_position_size=max_position_size,
-        max_drawdown=max_drawdown,
-        annual_trading_days=annual_trading_days,
-        transaction_cost=transaction_cost,
-        env_rank=trial.number + 1,
-        # Pass any additional parameters such as risk/reward weights if needed
-    )
-    env_train.seed(RANDOM_SEED + trial.number + 1)
-    vec_env_train = DummyVecEnv([lambda: env_train])
-    
-    # Initialize TD3 with the chosen hyperparameters.
+# Initialize TD3 model with best hyperparameters and enable CPU usage
+try:
     model = TD3(
-        "MlpPolicy",
+        'MlpPolicy',
         vec_env_train,
+        verbose=1,  # Enable logging
+        seed=RANDOM_SEED,
         policy_kwargs=policy_kwargs,
-        learning_rate=learning_rate,
-        buffer_size=buffer_size,
-        batch_size=batch_size,
-        tau=tau,
-        gamma=gamma,
-        verbose=0,
-        seed=RANDOM_SEED
+        learning_rate=best_params.get('learning_rate', 3e-4),
+        buffer_size=best_params.get('buffer_size', 1000000),  # Off-policy replay buffer size
+        batch_size=best_params.get('batch_size', 256),
+        tau=best_params.get('tau', 0.005),  # Soft update coefficient for target networks
+        gamma=best_params.get('gamma', 0.99),
+        tensorboard_log=str(main_training_log_dir),
+        device='cpu'
     )
-    
-    # Optionally, add callbacks similar to your PPO case.
-    checkpoint_callback = CheckpointCallback(
-        save_freq=50000,
-        save_path=str(RESULTS_DIR / f"checkpoints_td3_trial_{trial.number}"),
-        name_prefix="td3_model"
-    )
-    custom_callback = CustomTensorboardCallback()
-    early_stopping_callback = EarlyStoppingCallback(
-        monitor='train/reward_env',
-        patience=10000,
-        min_delta=1e-5,
-        verbose=1
-    )
-    callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
-    
-    start_time = time.time()
-    try:
-        # Note: TD3 is off-policy, so total_timesteps can be similar to your PPO case.
-        model.learn(total_timesteps=100000, callback=callback_list)
-    except Exception as e:
-        main_logger.critical(f"[TD3 Trial {trial.number}] Training failed: {e}")
-        return -np.inf
-    duration = time.time() - start_time
-    
-    # Evaluate cumulative reward from env history (similar to your PPO objective)
-    env_train_history = env_train.history
-    cumulative_reward = sum(entry.get('Reward', 0.0) for entry in env_train_history) if env_train_history else 0.0
-    
-    main_logger.critical(f"[TD3 Trial {trial.number}] Cumulative Reward: {cumulative_reward:.4f}")
-    return cumulative_reward
+except Exception as e:
+    main_logger.critical(f"TD3 Model initialization failed: {e}")
+    exit()
 
+# Define checkpoint and custom callbacks (same as before)
+checkpoint_callback = CheckpointCallback(
+    save_freq=50000,  # Adjust as needed
+    save_path=str(RESULTS_DIR / "checkpoints"),
+    name_prefix="td3_model"
+)
+custom_callback = CustomTensorboardCallback()
+early_stopping_callback = EarlyStoppingCallback(
+    monitor='train/reward_env',
+    patience=10000,
+    min_delta=1e-5,
+    verbose=1
+)
+callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
+
+# Start training
+start_time = time.time()
+try:
+    model.learn(
+        total_timesteps=500000,  # Adjust training steps as needed
+        callback=callback_list
+    )
+except Exception as e:
+    main_logger.critical(f"Training failed: {e}")
+    exit()
+duration = time.time() - start_time
+
+# Log Phase: Main Training Completed
+log_phase("Main Training", "Completed", {"env_rank": main_env_rank, "total_timesteps": 500000}, duration)
+
+# Save the trained model
+model_path = RESULTS_DIR / f"td3_model_{TICKER}.zip"
+model.save(str(model_path))
+main_logger.info(f"TD3 model trained and saved at {model_path}")
+
+============
+
+# --- SAC Model Initialization and Training ---
+
+# Initialize SAC model with best hyperparameters and enable CPU usage
+try:
+    model = SAC(
+        'MlpPolicy',
+        vec_env_train,
+        verbose=1,  # Enable logging
+        seed=RANDOM_SEED,
+        policy_kwargs=policy_kwargs,
+        learning_rate=best_params.get('learning_rate', 3e-4),
+        batch_size=best_params.get('batch_size', 256),
+        tau=best_params.get('tau', 0.005),  # Soft update coefficient
+        gamma=best_params.get('gamma', 0.99),
+        ent_coef=best_params.get('ent_coef', 0.02),  # SAC uses entropy coefficient for exploration
+        tensorboard_log=str(main_training_log_dir),
+        device='cpu'
+    )
+except Exception as e:
+    main_logger.critical(f"SAC Model initialization failed: {e}")
+    exit()
+
+# Define checkpoint and custom callbacks (similar to TD3)
+checkpoint_callback = CheckpointCallback(
+    save_freq=50000,  # Adjust as needed
+    save_path=str(RESULTS_DIR / "checkpoints"),
+    name_prefix="sac_model"
+)
+custom_callback = CustomTensorboardCallback()
+early_stopping_callback = EarlyStoppingCallback(
+    monitor='train/reward_env',
+    patience=10000,
+    min_delta=1e-5,
+    verbose=1
+)
+callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
+
+# Start training
+start_time = time.time()
+try:
+    model.learn(
+        total_timesteps=500000,  # Adjust training steps as needed
+        callback=callback_list
+    )
+except Exception as e:
+    main_logger.critical(f"Training failed: {e}")
+    exit()
+duration = time.time() - start_time
+
+# Log Phase: Main Training Completed
+log_phase("Main Training", "Completed", {"env_rank": main_env_rank, "total_timesteps": 500000}, duration)
+
+# Save the trained model
+model_path = RESULTS_DIR / f"sac_model_{TICKER}.zip"
+model.save(str(model_path))
+main_logger.info(f"SAC model trained and saved at {model_path}")
 
