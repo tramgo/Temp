@@ -776,7 +776,7 @@ class SingleStockTradingEnv(gym.Env):
             scaled_reward = np.tanh(raw_reward / 10)
 
         # Additional global scale from 'reward_scale'
-        scaled_reward = self.reward_weights.get('reward_scale', 1.0) * scaled_reward
+        scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
 
         normalized_reward = scaled_reward
 
@@ -800,7 +800,7 @@ class SingleStockTradingEnv(gym.Env):
             'Transaction_Penalty': transaction_penalty,
             'Holding_Bonus': holding_bonus,
             'Favorable_Hold_Factor': favorable_hold_factor,
-            'Invalid_Action_Penalty': invalid_action_penalty,
+            'Invalid_Action_Penalty': invalid_act_penalty,
             'profit_weight': profit_weight,
             'sharpe_bonus_weight': sharpe_bonus_weight,
             'holding_bonus_weight': holding_bonus_weight,
