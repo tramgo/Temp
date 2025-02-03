@@ -370,7 +370,7 @@ class SingleStockTradingEnv(gym.Env):
                 # --- NEWLY ADDED ARGS FOR TRAILING STOP ---
                 trailing_drawdown_trigger: float = 0.20,   # e.g. 20% from peak
                 trailing_drawdown_grace: int = 3,          # how many consecutive steps
-                forced_liquidation_penalty: float = -5.0  # extra penalty on forced sell):
+                forced_liquidation_penalty: float = -5.0):  # extra penalty on forced sell
         super(SingleStockTradingEnv, self).__init__()
 
         # Store new factor
