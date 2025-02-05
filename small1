@@ -387,9 +387,9 @@ class SingleStockTradingEnv(gym.Env):
         self.annual_trading_days = annual_trading_days
         self.transaction_cost = transaction_cost  # 0.1% per trade
         self.hold_threshold = hold_threshold
-		self.consecutive_drawdown_steps = 0
-		import collections
-		self.reward_history = collections.deque(maxlen=500)
+        self.consecutive_drawdown_steps = 0
+        import collections
+        self.reward_history = collections.deque(maxlen=500)
         
         # --- STORE NEW TRAILING STOP PARAMETERS ---
         self.trailing_drawdown_trigger = trailing_drawdown_trigger
@@ -544,11 +544,13 @@ class SingleStockTradingEnv(gym.Env):
         self.transaction_count = 0  # Initialize transaction count
         self.consecutive_drawdown_steps = 0
         self.reward_history.clear()
+        self.reward_ema = 0
         
         training_logger.debug(f"[Env {self.env_rank}] Environment reset.")
         return self._next_observation(), {}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
+        # --- Logging and Action Validation ---
         training_logger.debug(f"[Env {self.env_rank}] step() called at current_step={self.current_step} with action={action}")
         try:
             action_value = float(action[0])
@@ -557,18 +559,18 @@ class SingleStockTradingEnv(gym.Env):
             training_logger.error(f"[Env {self.env_rank}] Action validation failed: {e}")
             return self._next_observation(), -1000.0, True, False, {}
 
-        invalid_action_penalty = -0.01  # Small penalty for invalid buy/sell actions
-
-        hold_threshold = self.hold_threshold  # Use the tunable threshold from environment
+        invalid_action_penalty = -0.01
+        hold_threshold = self.hold_threshold
+        # Uncomment below if you wish to treat near-zero actions as Hold:
         # if abs(action_value) <= hold_threshold:
-            # action_value = 0.0  # Treat action as Hold
-            # training_logger.debug(f"[Env {self.env_rank}] Treating action {action} as Hold (within ±{hold_threshold}).")
+        #     action_value = 0.0
+        #     training_logger.debug(f"[Env {self.env_rank}] Action within threshold; treated as Hold.")
 
-        # End-of-data guard
+        # --- End-of-Data Guard ---
         if self.current_step >= len(self.df):
             terminated = True
             truncated = False
-            reward = -1000
+            reward = -1000.0
             obs = self._next_observation()
             self.history.append({
                 'Date': self.df.iloc[self.current_step]['Date'],
@@ -585,17 +587,18 @@ class SingleStockTradingEnv(gym.Env):
             training_logger.error(f"[Env {self.env_rank}] Terminating episode at step {self.current_step} due to data overflow.")
             return obs, reward, terminated, truncated, {}
 
-        # ============= Normal buy/sell/hold logic unchanged ============= #
+        # --- Get Current Data ---
         current_data = self.df.iloc[self.current_step]
         current_price = float(current_data['Close_unscaled'])
         current_date = current_data['Date']
 
         shares_traded = 0
         trade_cost = 0.0
-        invalid_act_penalty = 0.0  # Initialize local reward if you add mid-step penalties
+        invalid_act_penalty = 0.0
 
+        # --- Trading Logic ---
         if action_value > 0:
-            # Buy logic...
+            # Buy logic
             investment_amount = self.balance * action_value * self.max_position_size
             shares_to_buy = math.floor(investment_amount / current_price)
             if shares_to_buy == 0:
@@ -612,10 +615,9 @@ class SingleStockTradingEnv(gym.Env):
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Bought {shares_to_buy} shares at {current_price:.2f}")
             else:
                 invalid_act_penalty = invalid_action_penalty
-                training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough balance or no shares calculated.")
-
+                training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Buy action invalid (insufficient balance or zero shares calculated).")
         elif action_value < 0:
-            # Sell logic...
+            # Sell logic
             proportion_to_sell = abs(action_value) * self.max_position_size
             shares_to_sell = math.floor(self.position * proportion_to_sell)
             if shares_to_sell == 0 and self.position > 0:
@@ -630,59 +632,45 @@ class SingleStockTradingEnv(gym.Env):
                 training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sold {shares_to_sell} shares at {current_price:.2f}")
             else:
                 invalid_act_penalty = invalid_action_penalty
-                training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Not enough shares or shares_to_sell=0.")
+                training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Sell action invalid (insufficient shares).")
         else:
-            # Hold
+            # Hold action
             training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Hold action received.")
 
+        # --- Net Worth Calculation ---
         net_worth = float(self.balance + self.position * current_price)
         net_worth_change = net_worth - self.prev_net_worth
 
-        # Some existing forced stop logic (optional):
-        forced_stop_penalty = 0.0
-        if net_worth <= self.initial_balance * self.stop_loss and self.position > 0:
-            forced_stop_penalty = -3.0
+        # --- Forced Stop/Take Profit Penalties ---
+        forced_stop_penalty = -3.0 if (net_worth <= self.initial_balance * self.stop_loss and self.position > 0) else 0.0
+        forced_tp_penalty = -1.0 if (net_worth >= self.initial_balance * self.take_profit and self.position > 0) else 0.0
 
-        forced_tp_penalty = 0.0
-        if net_worth >= self.initial_balance * self.take_profit and self.position > 0:
-            forced_tp_penalty = -1.0
-
-        # ============= Standard reward terms =============
+        # --- Profit Reward Calculation ---
         profit_weight = self.reward_weights.get('profit_weight', 1.5)
-        sharpe_bonus_weight = self.reward_weights.get('sharpe_bonus_weight', 0.05)
-        holding_bonus_weight = self.reward_weights.get('holding_bonus_weight', 0.001)
-        
         profit_reward = (net_worth_change / self.initial_balance) * profit_weight
 
+        # --- Sharpe Bonus Calculation via Returns Window ---
         step_return = net_worth_change / self.initial_balance
         self.returns_window.append(step_return)
         if len(self.returns_window) > 30:
             self.returns_window.pop(0)
-
         if len(self.returns_window) >= 10:
             mean_return = np.mean(self.returns_window)
             std_return = np.std(self.returns_window) + 1e-9
             sharpe = mean_return / std_return
-            sharpe_bonus = sharpe * sharpe_bonus_weight
+            sharpe_bonus = sharpe * self.reward_weights.get('sharpe_bonus_weight', 0.05)
         else:
             sharpe_bonus = 0.0
 
-        # ============= Drawdown penalty as you had it =============
+        # --- Drawdown Penalty Calculation ---
         self.peak = max(self.peak, net_worth)
         current_drawdown = (self.peak - net_worth) / self.peak if self.peak > 0 else 0.0
-        drawdown_excess = current_drawdown - self.max_drawdown
         drawdown_penalty = 0.0
-        
-        # (A) Minor threshold at 5% drawdown
         if current_drawdown > 0.05:
-            # Subtract a base penalty (2.0) plus 1% * peak * factor
             drawdown_penalty -= (2.0 + self.initial_balance * self.some_factor)
-
-        # (B) If drawdown > 10% => multiply penalty by 1.25
         if current_drawdown > 0.1:
             drawdown_penalty = -abs(drawdown_penalty) * 1.25
-
-        # (C) If drawdown > 15% => partial forced liquidation + multiply again
+        # Partial forced liquidation if drawdown > 15%
         if current_drawdown > 0.15 and self.position > 0:
             shares_to_sell = math.floor(self.position * 0.5)
             if shares_to_sell > 0:
@@ -693,15 +681,11 @@ class SingleStockTradingEnv(gym.Env):
                 shares_traded = shares_to_sell
                 trade_cost += shares_traded * current_price * self.transaction_cost
                 self.peak = float(self.balance + self.position * current_price)
-                training_logger.info(
-                    f"[Env {self.env_rank}] Partial forced liquidation at ~15% drawdown. "
-                    f"Selling {shares_to_sell} shares..."
-                )
-
-        # Multiply penalty by 1.25 again
-        drawdown_penalty = -abs(drawdown_penalty) * 1.25
-
-        # (D) If drawdown > 20% => full forced liquidation + multiply once more
+                training_logger.info(f"[Env {self.env_rank}] Partial forced liquidation at ~15% drawdown. Selling {shares_to_sell} shares...")
+                # Reset drawdown counter and update prev_net_worth immediately
+                self.consecutive_drawdown_steps = 0
+                self.prev_net_worth = float(self.balance + self.position * current_price)
+        # Full forced liquidation if drawdown > 20%
         if current_drawdown > 0.2 and self.position > 0:
             shares_to_sell = self.position
             if shares_to_sell > 0:
@@ -712,19 +696,20 @@ class SingleStockTradingEnv(gym.Env):
                 trade_cost += shares_traded * current_price * self.transaction_cost
                 self.position = 0
                 self.peak = self.balance
-                training_logger.info(
-                    f"[Env {self.env_rank}] Full forced liquidation at ~20% drawdown. "
-                    f"Selling {shares_to_sell} shares..."
-                )
+                training_logger.info(f"[Env {self.env_rank}] Full forced liquidation at ~20% drawdown. Selling {shares_to_sell} shares...")
+                # Reset drawdown counter and update prev_net_worth immediately
+                self.consecutive_drawdown_steps = 0
+                self.prev_net_worth = self.balance
 
-        # Multiply penalty by 1.25 again
+        # Apply an additional multiplier to the drawdown penalty if needed
         drawdown_penalty = -abs(drawdown_penalty) * 1.25
-                
+
+        # Recalculate net_worth after any forced liquidations
         net_worth = float(self.balance + self.position * current_price)
         self.net_worth = net_worth
 
-        # ============= Holding bonus snippet =============
-        hold_factor = max(0, 1 - abs(action_value)/0.1)
+        # --- Holding Bonus Calculation ---
+        hold_factor = max(0, 1 - abs(action_value) / 0.1)
         raw_vol = current_data['Volatility_unscaled']
         vol_thresh = self.reward_weights.get('volatility_threshold', 1.0)
         volatility_factor = 1.0 - np.clip(raw_vol / vol_thresh, 0.0, 1.0)
@@ -740,46 +725,31 @@ class SingleStockTradingEnv(gym.Env):
         holding_bonus_weight = self.reward_weights.get('holding_bonus_weight', 0.001)
         holding_bonus = favorable_hold_factor * holding_bonus_weight * net_worth
 
+        # --- Transaction Penalty Calculation ---
         penalty_scale = self.reward_weights.get('transaction_penalty_scale', 1.0)
         transaction_penalty = -(trade_cost / self.initial_balance) * penalty_scale
 
-        # ============= Accumulate total reward so far =============
-        reward = (
-            profit_reward +
-            sharpe_bonus +
-            forced_stop_penalty +
-            forced_tp_penalty +
-            drawdown_penalty +
-            transaction_penalty +
-            holding_bonus +
-            invalid_act_penalty
-        )
-        
-        # Accumulate final raw_reward
-        raw_reward = reward
+        # --- Accumulate Raw Reward (All Components) ---
+        raw_reward = (profit_reward + sharpe_bonus + forced_stop_penalty +
+                      forced_tp_penalty + drawdown_penalty +
+                      transaction_penalty + holding_bonus + invalid_act_penalty)
 
-        # DYNAMIC SCALING WITH ROLLING STD
-        if not hasattr(self, 'reward_history'):
-            import collections
-            self.reward_history = collections.deque(maxlen=500)
-
-        self.reward_history.append(raw_reward)
-
-        # after we have enough steps, compute local std
-        if len(self.reward_history) > 50:
-            local_std = np.std(self.reward_history)
-            if local_std < 1e-6:
-                local_std = 1
-            scale_factor = 2.0 * local_std  # e.g., 2 * std
-            scaled_reward = np.tanh(raw_reward / scale_factor)
-        else:
-            scaled_reward = np.tanh(raw_reward / 10)
-
-        # Additional global scale from 'reward_scale'
+        # --- EMA-Based Reward Smoothing for Raw Reward ---
+        # Initialize EMA variables if they don't exist
+        if not hasattr(self, 'reward_ema'):
+            self.reward_ema = 0.0
+            self.reward_var_ema = 1e-6
+            self.ema_alpha = 0.01  # Smoothing factor
+        current_raw = raw_reward
+        self.reward_ema = self.ema_alpha * current_raw + (1 - self.ema_alpha) * self.reward_ema
+        self.reward_var_ema = self.ema_alpha * ((current_raw - self.reward_ema) ** 2) + (1 - self.ema_alpha) * self.reward_var_ema
+        normalized_reward = (raw_reward - self.reward_ema) / (np.sqrt(self.reward_var_ema) + 1e-8)
+        scaled_reward = np.tanh(normalized_reward)
+        # Apply any additional global scaling
         scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
-
         normalized_reward = scaled_reward
 
+        # --- Append Step Details to History ---
         self.history.append({
             'Date': current_date,
             'Close_unscaled': current_price,
@@ -801,18 +771,14 @@ class SingleStockTradingEnv(gym.Env):
             'Holding_Bonus': holding_bonus,
             'Favorable_Hold_Factor': favorable_hold_factor,
             'Invalid_Action_Penalty': invalid_act_penalty,
-            'profit_weight': profit_weight,
-            'sharpe_bonus_weight': sharpe_bonus_weight,
-            'holding_bonus_weight': holding_bonus_weight,
-            'DD_weight': self.some_factor
+            'reward_scale': self.reward_weights.get('reward_scale', 1.0)
         })
-        
         training_logger.debug(f"[Env {self.env_rank}] History appended at step {self.current_step}. Current History Length: {len(self.history)}")
 
+        # --- Termination Check ---
         terminated = False
         truncated = False
         MIN_STEPS = 10
-
         if self.current_step >= MIN_STEPS:
             if net_worth <= 0:
                 terminated = True
@@ -822,6 +788,7 @@ class SingleStockTradingEnv(gym.Env):
                 terminated = True
                 training_logger.info(f"[Env {self.env_rank}] Reached end of data at step {self.current_step}. Terminating episode.")
 
+        # --- Update Step ---
         if not terminated:
             self.prev_net_worth = net_worth
             training_logger.debug(f"[Env {self.env_rank}] Before increment: Step {self.current_step}")
@@ -829,10 +796,10 @@ class SingleStockTradingEnv(gym.Env):
             training_logger.debug(f"[Env {self.env_rank}] After increment: Step {self.current_step}")
         else:
             training_logger.debug(f"[Env {self.env_rank}] Episode terminated at step {self.current_step}")
-
         self.current_step = min(self.current_step, len(self.df) - 1)
         obs = self._next_observation()
 
+        # --- Periodic Logging ---
         if self.current_step % 100 == 0 or terminated:
             training_logger.debug(f"[Env {self.env_rank}] Step {self.current_step}: Reward = {normalized_reward:.4f}, Net Worth = {net_worth:.2f}, Balance = {self.balance:.2f}, Position = {self.position}")
             training_logger.info(f"[Env {self.env_rank}] Step {self.current_step}: Reward = {normalized_reward:.4f}, Net Worth = {net_worth:.2f}, Balance = {self.balance:.2f}, Position = {self.position}")
@@ -840,6 +807,7 @@ class SingleStockTradingEnv(gym.Env):
         training_logger.debug(f"[Env {self.env_rank}] After Action {action_value}: Balance = {self.balance}, Position = {self.position}, Net Worth = {net_worth}")
 
         return obs, normalized_reward, terminated, truncated, {}
+
 
 ##############################################
 # Baseline Strategies
