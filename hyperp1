@@ -1,66 +1,45 @@
-self.observation_space = spaces.Box(
-    low=-np.inf, high=np.inf,
-    shape=(self.num_features + 3 + len(self.market_phase) + 2,),
-    dtype=np.float32
-)
-
-self.peak = max(self.peak, net_worth)
-if self.peak > 0:
-    current_drawdown = (self.peak - net_worth)/self.peak
-else:
-    current_drawdown = 0.0
-
-# Step 1: apply penalty unconditionally
-layered_penalty = 0.0
-
-if current_drawdown > 0.01:
-    layered_penalty -= 0.01 * self.peak * self.some_factor
-
-# etc. for 2% threshold
-
-reward += layered_penalty
-
-# Step 2: forced liquidation only if position>0
-if current_drawdown > 0.03 and self.position>0:
-    # partial forced liquidation
-    shares_to_sell = math.floor(self.position * 0.5)
-    ...
-if current_drawdown > 0.05 and self.position>0:
-    # full forced liquidation
-    ...
-
+import pywt  # make sure PyWavelets is installed
 
 def _next_observation(self) -> np.ndarray:
-    """
-    Constructs and returns the current observation for the agent,
-    including:
-      1) The existing technical features
-      2) Scaled balance/net_worth/position
-      3) One-hot market phase
-      4) current_drawdown_fraction
-      5) drawdown_buffer
-    """
-
-    # (A) Ensure we don't go out of bounds
+    # (A) Ensure we don't go out of bounds.
     if self.current_step >= len(self.df):
         self.current_step = len(self.df) - 1
 
-    # (B) Get the row/data at current_step
+    # (B) Get the row/data at the current step.
     current_data = self.df.iloc[self.current_step]
 
-    # (C) Extract the technical feature array
-    #    Suppose self.feature_names = list of your scaled columns
+    # (C) Extract the technical feature array from the current row.
     features = current_data[self.feature_names].values  # shape = (num_features,)
+    obs = list(features)  # start with the standard features
 
-    # Build a list to accumulate obs
-    obs = list(features)  # now you have your num_features indicator columns
+    # *** Wavelet Transformation for Additional Features ***
+    # Define a fixed window size (e.g., 32) for the 'Close_unscaled' series.
+    window_size = 32
+    if self.current_step < window_size:
+        # Not enough data: pad the beginning with the first available value.
+        prices = self.df['Close_unscaled'].iloc[:self.current_step].values
+        padded_prices = np.pad(prices, (window_size - len(prices), 0), mode='edge')
+    else:
+        padded_prices = self.df['Close_unscaled'].iloc[self.current_step - window_size:self.current_step].values
 
-    # (D) Add scaled balance, net worth, position
+    # Perform discrete wavelet decomposition using Daubechies 1 (db1) up to level 2.
+    coeffs = pywt.wavedec(padded_prices, 'db1', level=2)
+    # coeffs is a list: [cA2, cD2, cD1]
+    # For each set of coefficients, compute summary statistics (e.g., mean and standard deviation).
+    wavelet_features = []
+    for c in coeffs:
+        wavelet_features.append(np.mean(c))
+        wavelet_features.append(np.std(c))
+    # Append the wavelet features to the observation vector.
+    obs.extend(wavelet_features)
+    # (Now, if using level=2 with 'db1', you'll be adding 3*2 = 6 extra features.)
+
+    # (D) Append scaled account features: balance, net worth, and position.
     obs.append(self.balance / self.initial_balance)
     obs.append(self.net_worth / self.initial_balance)
     obs.append(self.position / self.initial_balance)
 
-    # (E) Market phase logic (existing approach)
+    # (E) Append one-hot encoded market phase information.
     try:
         adx = float(current_data['ADX_unscaled'])
     except KeyError:
@@ -71,48 +50,36 @@ def _next_observation(self) -> np.ndarray:
         try:
             sma10 = float(current_data['SMA10_unscaled'])
             sma50 = float(current_data['SMA50_unscaled'])
-            if sma10 > sma50:
-                phase = 'Bull'
-            else:
-                phase = 'Bear'
+            phase = 'Bull' if sma10 > sma50 else 'Bear'
         except KeyError as e:
             self.training_logger.error(f"[Env {self.env_rank}] Missing SMA columns: {e}. Setting phase=Sideways.")
             phase = 'Sideways'
     else:
         phase = 'Sideways'
-
-    # One-hot encode: for p in self.market_phase = ['Bull','Bear','Sideways']
     for p in self.market_phase:
         obs.append(1.0 if phase == p else 0.0)
 
-    # (F) current_drawdown_fraction
-    #    We assume self.peak is updated each step => self.peak = max(self.peak, self.net_worth)
+    # (F) Append current drawdown fraction.
     if self.peak > 0:
         current_drawdown_fraction = (self.peak - self.net_worth) / self.peak
     else:
-        current_drawdown_fraction = 0.0  # no drawdown if peak=0 or net_worth=0
-
+        current_drawdown_fraction = 0.0
     obs.append(current_drawdown_fraction)
 
-    # (G) drawdown_buffer = meltdown_threshold - current_drawdown_fraction
-    meltdown_threshold = self.max_drawdown  # e.g. 0.15
+    # (G) Append the drawdown buffer.
+    meltdown_threshold = self.max_drawdown  # e.g., 0.15
     drawdown_buffer = meltdown_threshold - current_drawdown_fraction
     if drawdown_buffer < 0.0:
         drawdown_buffer = 0.0
-
     obs.append(drawdown_buffer)
 
-    # (H) Convert to np.array
+    # (H) Convert observation list to np.array and sanitize.
     obs = np.array(obs, dtype=np.float32)
-
-    # Replace any NaN or Inf with 0
     if np.isnan(obs).any() or np.isinf(obs).any():
         obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # (I) Sanity checks
-    # E.g. your obs space shape = (self.num_features + 3 + len(self.market_phase) + 2,)
+    # (I) Sanity check: Update expected observation space shape accordingly.
     expected_size = self.observation_space.shape[0]
     assert obs.shape[0] == expected_size, f"Observation shape mismatch: got {obs.shape[0]} vs {expected_size}"
-    assert not np.isnan(obs).any(), "Observation still has NaN!"
 
     return obs
