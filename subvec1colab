@@ -1,0 +1,1637 @@
+import os
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+import pandas as pd
+from ta import trend, momentum, volatility, volume
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.backends.backend_pdf import PdfPages
+import yfinance as yf
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
+
+import torch
+import warnings
+from typing import Optional, Tuple
+import random
+import datetime
+import math
+import logging
+from pathlib import Path
+import optuna
+import joblib
+import time
+import plotly.io as pio
+
+try:
+    from concurrent_log_handler import ConcurrentRotatingFileHandler
+except ImportError:
+    raise ImportError("Please install 'concurrent-log-handler' package via pip: pip install concurrent-log-handler")
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+torch.manual_seed(RANDOM_SEED)
+
+BASE_DIR = Path('.').resolve()
+RESULTS_DIR = BASE_DIR / 'results'
+PLOTS_DIR = BASE_DIR / 'plots'
+TB_LOG_DIR = BASE_DIR / 'tensorboard_logs'
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+TB_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def setup_logger(name: str, log_file: Path, level=logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    if not logger.handlers:
+        handler = ConcurrentRotatingFileHandler(str(log_file), maxBytes=10**6, backupCount=5, encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
+main_logger = setup_logger('main_logger', RESULTS_DIR / 'main.log', level=logging.DEBUG)
+training_logger = setup_logger('training_logger', RESULTS_DIR / 'training.log', level=logging.DEBUG)
+testing_logger = setup_logger('testing_logger', RESULTS_DIR / 'testing.log', level=logging.DEBUG)
+phase_logger = setup_logger('phase_logger', RESULTS_DIR / 'phase.log', level=logging.INFO)
+
+def log_phase(phase: str, status: str = "Starting", env_details: dict = None, duration: float = None):
+    log_message = f"***** {status} {phase} *****"
+    if env_details:
+        log_message += f"\nEnvironment Details: {env_details}"
+    if duration is not None:
+        log_message += f"\nDuration: {duration:.2f} seconds ({duration/60:.2f} minutes)"
+    phase_logger.info(log_message)
+
+def check_versions():
+    import stable_baselines3
+    import gymnasium
+    import optuna
+    sb3_version = stable_baselines3.__version__
+    gymnasium_version = gymnasium.__version__
+    optuna_version = optuna.__version__
+    main_logger.debug(f"Stable Baselines3 version: {sb3_version}")
+    main_logger.debug(f"Gymnasium version: {gymnasium_version}")
+    main_logger.debug(f"Optuna version: {optuna_version}")
+    try:
+        sb3_major, sb3_minor, sb3_patch = map(int, sb3_version.split('.')[:3])
+        if sb3_major < 2:
+            main_logger.error("Stable Baselines3 version must be at least 2.0.0. Please upgrade SB3.")
+            exit()
+    except:
+        main_logger.error("Unable to parse Stable Baselines3 version. Please ensure it's installed correctly.")
+        exit()
+    if gymnasium_version < '0.28.1':
+        main_logger.warning("Consider upgrading Gymnasium to the latest version for better compatibility.")
+
+check_versions()
+
+# We define the feature list but do not scale it in this revised code
+FEATURES_TO_SCALE = [
+    'Close', 'SMA10', 'SMA50', 'RSI', 'MACD', 'ADX',
+    'BB_Upper', 'BB_Lower', 'Bollinger_Width',
+    'EMA20', 'VWAP', 'Lagged_Return', 'Volatility'
+]
+
+class SingleStockTradingEnv(gym.Env):
+    metadata = {'render.modes': ['human']}
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        initial_balance: float = 100000,
+        stop_loss: float = 0.90,
+        take_profit: float = 1.10,
+        max_position_size: float = 0.5,
+        max_drawdown: float = 0.20,
+        annual_trading_days: int = 252,
+        transaction_cost: float = 0.0001,
+        env_rank: int = 0,
+        some_factor: float = 0.01,
+        hold_threshold: float = 0.1, 
+        reward_weights: Optional[dict] = None,
+        trailing_drawdown_trigger: float = 0.20,
+        trailing_drawdown_grace: int = 3,
+        forced_liquidation_penalty: float = -5.0
+    ):
+        super(SingleStockTradingEnv, self).__init__()
+        self.env_rank = env_rank
+        self.df = df.copy().reset_index(drop=True)
+
+        self.initial_balance = initial_balance
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.max_position_size = max_position_size
+        self.max_drawdown = max_drawdown
+        self.annual_trading_days = annual_trading_days
+        self.transaction_cost = transaction_cost
+        self.some_factor = some_factor
+        self.hold_threshold = hold_threshold
+        self.trailing_drawdown_trigger = trailing_drawdown_trigger
+        self.trailing_drawdown_grace = trailing_drawdown_grace
+        self.forced_liquidation_penalty = forced_liquidation_penalty
+
+        import collections
+        self.reward_history = collections.deque(maxlen=500)
+
+        self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
+        self.num_features = len(FEATURES_TO_SCALE)
+        self.market_phase = ['Bull', 'Bear', 'Sideways']
+
+        # shape = (#technical features) + 3 for (balance ratio, net_worth ratio, position ratio)
+        #        + len(market_phase) + 2 for drawdown stats
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(self.num_features + 3 + len(self.market_phase) + 2,),
+            dtype=np.float32
+        )
+
+        if reward_weights is not None:
+            self.reward_weights = reward_weights
+        else:
+            self.reward_weights = {'reward_scale': 1.0}
+
+        self.reset()
+
+    def seed(self, seed=None):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        training_logger.debug(f"[Env {self.env_rank}] Seed set to {seed}")
+
+    def _next_observation(self) -> np.ndarray:
+        if self.current_step >= len(self.df):
+            self.current_step = len(self.df) - 1
+        current_data = self.df.iloc[self.current_step]
+
+        # ----------------------------------------------------------------------
+        # Use the raw columns (Close, RSI, ADX, etc.) instead of *_unscaled
+        # ----------------------------------------------------------------------
+        features = current_data[FEATURES_TO_SCALE].values
+
+        obs_list = list(features)
+        obs_list.append(self.balance / self.initial_balance)
+        obs_list.append(self.net_worth / self.initial_balance)
+        obs_list.append(self.position / self.initial_balance)
+
+        # Market phase logic
+        try:
+            adx_val = float(current_data['ADX'])
+        except KeyError:
+            adx_val = 0.0
+        phase = 'Sideways'
+        if adx_val > 25:
+            try:
+                sma10_val = float(current_data['SMA10'])
+                sma50_val = float(current_data['SMA50'])
+                if sma10_val > sma50_val:
+                    phase = 'Bull'
+                else:
+                    phase = 'Bear'
+            except KeyError:
+                phase = 'Sideways'
+
+        for p in self.market_phase:
+            obs_list.append(1.0 if phase == p else 0.0)
+
+        if self.peak > 0:
+            current_drawdown_fraction = (self.peak - self.net_worth) / self.peak
+        else:
+            current_drawdown_fraction = 0.0
+
+        obs_list.append(current_drawdown_fraction)
+        meltdown_threshold = self.max_drawdown
+        drawdown_buffer = max(0.0, meltdown_threshold - current_drawdown_fraction)
+        obs_list.append(drawdown_buffer)
+
+        obs = np.array(obs_list, dtype=np.float32)
+        if np.isnan(obs).any() or np.isinf(obs).any():
+            obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        expected_size = self.observation_space.shape[0]
+        assert obs.shape[0] == expected_size, f"Observation shape mismatch: {obs.shape[0]} vs {expected_size}"
+        return obs
+
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+        self.balance = self.initial_balance
+        self.position = 0
+        self.net_worth = self.initial_balance
+        self.current_step = 0
+        self.history = []
+        self.prev_net_worth = self.net_worth
+        self.last_action = 0.0
+        self.peak = self.net_worth
+        self.returns_window = []
+        self.transaction_count = 0
+        self.consecutive_drawdown_steps = 0
+        self.reward_history.clear()
+        return self._next_observation(), {}
+
+    def step(self, action: np.ndarray):
+        print(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
+        training_logger.debug(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
+        training_logger.debug(f"[Env {self.env_rank}] step() called at current_step={self.current_step} with action={action}")
+
+        training_logger.debug(
+            f"[Env {self.env_rank} step()] action={action} "
+            f"type={type(action)} "
+            f"shape={(action.shape if hasattr(action, 'shape') else None)}"
+        )
+        try:
+            action_value = float(action[0])
+            assert self.action_space.contains(action), f"[Env {self.env_rank}] Invalid action: {action}"
+        except Exception as e:
+            training_logger.error(f"[Env {self.env_rank}] Action validation failed: {e}")
+            return self._next_observation(), -1000.0, True, False, {}
+
+        invalid_action_penalty = -0.01
+        if self.current_step >= len(self.df):
+            terminated = True
+            truncated = False
+            reward = -1000
+            obs = self._next_observation()
+            self.history.append({
+                'Date': None,
+                'Close': None,
+                'Action': np.nan,
+                'Buy_Signal_Price': np.nan,
+                'Sell_Signal_Price': np.nan,
+                'Net Worth': self.net_worth,
+                'Balance': self.balance,
+                'Position': self.position,
+                'Reward': reward,
+                'Trade_Cost': 0.0
+            })
+            training_logger.error(f"[Env {self.env_rank}] Terminating episode at step {self.current_step} due to data overflow.")
+            return obs, reward, terminated, truncated, {}
+
+        current_data = self.df.iloc[self.current_step]
+        current_price = float(current_data['Close'])
+        current_date = current_data['Date']
+
+        shares_traded = 0
+        trade_cost = 0.0
+        invalid_act_penalty = 0.0
+
+        if action_value > 0:
+            investment_amount = self.balance * action_value * self.max_position_size
+            shares_to_buy = math.floor(investment_amount / current_price)
+            if shares_to_buy == 0:
+                one_share_cost = current_price * (1 + self.transaction_cost)
+                if one_share_cost <= self.balance:
+                    shares_to_buy = 1
+            total_cost = shares_to_buy * current_price * (1 + self.transaction_cost)
+            if shares_to_buy > 0 and total_cost <= self.balance:
+                self.balance -= total_cost
+                self.position += shares_to_buy
+                self.transaction_count += 1
+                shares_traded = shares_to_buy
+                trade_cost = shares_traded * current_price * self.transaction_cost
+            else:
+                invalid_act_penalty = invalid_action_penalty
+
+        elif action_value < 0:
+            proportion_to_sell = abs(action_value) * self.max_position_size
+            shares_to_sell = math.floor(self.position * proportion_to_sell)
+            if shares_to_sell == 0 and self.position > 0:
+                shares_to_sell = 1
+            if shares_to_sell > 0 and shares_to_sell <= self.position:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.position -= shares_to_sell
+                self.balance += proceeds
+                self.transaction_count += 1
+                shares_traded = shares_to_sell
+                trade_cost = shares_traded * current_price * self.transaction_cost
+            else:
+                invalid_act_penalty = invalid_action_penalty
+        else:
+            pass  # Holding
+
+        net_worth = float(self.balance + self.position * current_price)
+        net_worth_change = net_worth - self.prev_net_worth
+
+        forced_stop_penalty = 0.0
+        if net_worth <= self.initial_balance * self.stop_loss and self.position > 0:
+            forced_stop_penalty = -3.0
+
+        forced_tp_penalty = 0.0
+        if net_worth >= self.initial_balance * self.take_profit and self.position > 0:
+            forced_tp_penalty = -1.0
+
+        profit_weight = self.reward_weights.get('profit_weight', 1.5)
+        sharpe_bonus_weight = self.reward_weights.get('sharpe_bonus_weight', 0.05)
+        holding_bonus_weight = self.reward_weights.get('holding_bonus_weight', 0.001)
+
+        profit_reward = (net_worth_change / self.initial_balance) * profit_weight
+        step_return = net_worth_change / self.initial_balance
+        self.returns_window.append(step_return)
+        if len(self.returns_window) > 30:
+            self.returns_window.pop(0)
+
+        if len(self.returns_window) >= 10:
+            mean_return = np.mean(self.returns_window)
+            std_return = np.std(self.returns_window) + 1e-9
+            sharpe = mean_return / std_return
+            sharpe_bonus = sharpe * sharpe_bonus_weight
+        else:
+            sharpe_bonus = 0.0
+
+        self.peak = max(self.peak, net_worth)
+        current_drawdown = (self.peak - net_worth) / self.peak if self.peak > 0 else 0.0
+        drawdown_penalty = 0.0
+        if current_drawdown > 0.05:
+            drawdown_penalty -= (2.0 + self.initial_balance * self.some_factor)
+        if current_drawdown > 0.1:
+            drawdown_penalty = -abs(drawdown_penalty) * 1.25
+        if current_drawdown > 0.15 and self.position > 0:
+            shares_to_sell = math.floor(self.position * 0.5)
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.balance += proceeds
+                self.position -= shares_to_sell
+                self.transaction_count += 1
+        drawdown_penalty = -abs(drawdown_penalty) * 1.25
+        if current_drawdown > 0.2 and self.position > 0:
+            shares_to_sell = self.position
+            if shares_to_sell > 0:
+                proceeds = shares_to_sell * current_price * (1 - self.transaction_cost)
+                self.balance += proceeds
+                self.position = 0
+                self.transaction_count += 1
+                self.peak = self.balance
+
+        net_worth = float(self.balance + self.position * current_price)
+        self.net_worth = net_worth
+
+        hold_factor = max(0, 1 - abs(action_value)/0.1)
+        raw_vol = current_data['Volatility']
+        vol_thresh = self.reward_weights.get('volatility_threshold', 1.0)
+        volatility_factor = 1.0 - np.clip(raw_vol / vol_thresh, 0.0, 1.0)
+
+        mom_thresh_min = self.reward_weights.get('momentum_threshold_min', 30)
+        mom_thresh_max = self.reward_weights.get('momentum_threshold_max', 70)
+        if mom_thresh_max > mom_thresh_min:
+            raw_rsi = current_data['RSI']
+            rsi_factor = (raw_rsi - mom_thresh_min) / (mom_thresh_max - mom_thresh_min)
+            rsi_factor = np.clip(rsi_factor, 0.0, 1.0)
+        else:
+            rsi_factor = 0.0
+
+        favorable_hold_factor = hold_factor * volatility_factor * rsi_factor
+        holding_bonus = favorable_hold_factor * holding_bonus_weight * net_worth
+
+        penalty_scale = self.reward_weights.get('transaction_penalty_scale', 1.0)
+        transaction_penalty = -(trade_cost / self.initial_balance) * penalty_scale
+
+        reward = (
+            profit_reward
+            + sharpe_bonus
+            + forced_stop_penalty
+            + forced_tp_penalty
+            + drawdown_penalty
+            + transaction_penalty
+            + holding_bonus
+            + invalid_act_penalty
+        )
+
+        raw_reward = reward
+        self.reward_history.append(raw_reward)
+        if len(self.reward_history) > 50:
+            local_std = np.std(self.reward_history)
+            if local_std < 1e-6:
+                local_std = 1
+            scale_factor = 2.0 * local_std
+            scaled_reward = math.tanh(float(raw_reward) / scale_factor)
+        else:
+            scaled_reward = math.tanh(float(raw_reward) / 10)
+
+        scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
+        normalized_reward = scaled_reward
+
+        self.history.append({
+            'Date': current_date,
+            'Close': current_price,
+            'Action': action_value,
+            'Buy_Signal_Price': current_price if action_value > 0 else np.nan,
+            'Sell_Signal_Price': current_price if action_value < 0 else np.nan,
+            'Net Worth': net_worth,
+            'Balance': self.balance,
+            'Position': self.position,
+            'Reward': normalized_reward,
+            'raw_reward': raw_reward,
+            'Trade_Cost': trade_cost
+        })
+
+        terminated = False
+        truncated = False
+        MIN_STEPS = 10
+        if self.current_step >= MIN_STEPS:
+            if net_worth <= 0:
+                terminated = True
+                normalized_reward -= 10.0
+            elif self.current_step >= len(self.df) - 1:
+                terminated = True
+
+        if not terminated:
+            self.prev_net_worth = net_worth
+            self.current_step += 1
+        self.current_step = min(self.current_step, len(self.df) - 1)
+
+        obs = self._next_observation()
+        return obs, normalized_reward, terminated, truncated, {}
+
+def buy_and_hold_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001):
+    df = df.reset_index(drop=True)
+    balance = initial_balance
+    holdings = 0
+    net_worth = initial_balance
+    history = []
+
+    if 'Close' not in df.columns:
+        return {'Strategy': 'Buy and Hold', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    df = df.dropna(subset=['Close'])
+    if df.empty:
+        return {'Strategy': 'Buy and Hold', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    try:
+        investment_percentage = 1.0
+        investment_amount = initial_balance * investment_percentage
+        buy_price = df.iloc[0]['Close']
+        shares_to_buy = math.floor(investment_amount / buy_price)
+        cost = shares_to_buy * buy_price * transaction_cost
+        balance -= (shares_to_buy * buy_price + cost)
+        holdings += shares_to_buy
+
+        history.append({
+            'Date': df.iloc[0]['Date'],
+            'Close': buy_price,
+            'Action': 'Buy',
+            'Buy_Signal_Price': buy_price,
+            'Sell_Signal_Price': np.nan,
+            'Net Worth': balance + holdings * buy_price,
+            'Balance': balance,
+            'Position': holdings,
+            'Reward': 0.0
+        })
+
+        final_price = df.iloc[-1]['Close']
+        net_worth = balance + holdings * final_price
+        profit = net_worth - initial_balance
+
+        history.append({
+            'Date': df.iloc[-1]['Date'],
+            'Close': final_price,
+            'Action': 'Sell',
+            'Buy_Signal_Price': np.nan,
+            'Sell_Signal_Price': final_price,
+            'Net Worth': net_worth,
+            'Balance': net_worth,
+            'Position': 0,
+            'Reward': profit / initial_balance
+        })
+
+    except Exception:
+        return {'Strategy': 'Buy and Hold', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    history_df = pd.DataFrame(history)
+    return {'Strategy': 'Buy and Hold', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': profit}, history_df
+
+
+def moving_average_crossover_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5):
+    df = df.reset_index(drop=True)
+    balance = initial_balance
+    holdings = 0
+    net_worth = initial_balance
+    history = []
+    buy_price = 0.0
+
+    required_cols = ['SMA10', 'SMA50', 'Close']
+    if not all(col in df.columns for col in required_cols):
+        return {'Strategy': 'Moving Average Crossover', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    df = df.dropna(subset=required_cols)
+    for idx in range(1, len(df)):
+        prev_sma10 = df.iloc[idx - 1]['SMA10']
+        prev_sma50 = df.iloc[idx - 1]['SMA50']
+        current_sma10 = df.iloc[idx]['SMA10']
+        current_sma50 = df.iloc[idx]['SMA50']
+        close_price = df.iloc[idx]['Close']
+        date = df.iloc[idx]['Date']
+
+        if prev_sma10 < prev_sma50 and current_sma10 > current_sma50:
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / close_price)
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * close_price * (1 + transaction_cost)
+                if total_cost <= balance:
+                    balance -= total_cost
+                    holdings += shares_to_buy
+                    buy_price = close_price
+                    history.append({
+                        'Date': date,
+                        'Close': close_price,
+                        'Action': 'Buy',
+                        'Buy_Signal_Price': close_price,
+                        'Sell_Signal_Price': np.nan,
+                        'Net Worth': balance + holdings * close_price,
+                        'Balance': balance,
+                        'Position': holdings,
+                        'Reward': 0.0
+                    })
+
+        elif prev_sma10 > prev_sma50 and current_sma10 < current_sma50:
+            if holdings > 0:
+                proceeds = holdings * close_price * (1 - transaction_cost)
+                balance += proceeds
+                holdings = 0
+                net_worth = balance
+                profit = (close_price - buy_price) * (proceeds / close_price)
+                reward = profit / initial_balance
+                history.append({
+                    'Date': date,
+                    'Close': close_price,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': np.nan,
+                    'Sell_Signal_Price': close_price,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': 0,
+                    'Reward': reward
+                })
+
+    final_price = df.iloc[-1]['Close']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
+    if holdings > 0:
+        proceeds = holdings * final_price * (1 - transaction_cost)
+        balance += proceeds
+        profit += (final_price - buy_price) * holdings
+        net_worth = balance
+        history.append({
+            'Date': df.iloc[-1]['Date'],
+            'Close': final_price,
+            'Action': 'Sell',
+            'Buy_Signal_Price': np.nan,
+            'Sell_Signal_Price': final_price,
+            'Net Worth': net_worth,
+            'Balance': balance,
+            'Position': 0,
+            'Reward': profit / initial_balance
+        })
+
+    history_df = pd.DataFrame(history)
+    return {'Strategy': 'Moving Average Crossover', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': profit}, history_df
+
+def macd_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5):
+    df = df.reset_index(drop=True)
+    balance = initial_balance
+    holdings = 0
+    net_worth = initial_balance
+    history = []
+    buy_price = 0.0
+
+    required_cols = ['MACD', 'Close']
+    if not all(col in df.columns for col in required_cols):
+        return {'Strategy': 'MACD Crossover', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    df = df.dropna(subset=required_cols)
+    for idx in range(1, len(df)):
+        prev_macd = df.iloc[idx - 1]['MACD']
+        current_macd = df.iloc[idx]['MACD']
+        close_price = df.iloc[idx]['Close']
+        date = df.iloc[idx]['Date']
+
+        if prev_macd < 0 and current_macd > 0:
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / close_price)
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * close_price * (1 + transaction_cost)
+                if total_cost <= balance:
+                    balance -= total_cost
+                    holdings += shares_to_buy
+                    buy_price = close_price
+                    history.append({
+                        'Date': date,
+                        'Close': close_price,
+                        'Action': 'Buy',
+                        'Buy_Signal_Price': close_price,
+                        'Sell_Signal_Price': np.nan,
+                        'Net Worth': balance + holdings * close_price,
+                        'Balance': balance,
+                        'Position': holdings,
+                        'Reward': 0.0
+                    })
+
+        elif prev_macd > 0 and current_macd < 0:
+            if holdings > 0:
+                proceeds = holdings * close_price * (1 - transaction_cost)
+                balance += proceeds
+                holdings = 0
+                profit = (close_price - buy_price) * (proceeds / close_price)
+                reward = profit / initial_balance
+                net_worth = balance
+                history.append({
+                    'Date': date,
+                    'Close': close_price,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': np.nan,
+                    'Sell_Signal_Price': close_price,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+
+    final_price = df.iloc[-1]['Close']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
+    if holdings > 0:
+        proceeds = holdings * final_price * (1 - transaction_cost)
+        balance += proceeds
+        profit += (final_price - buy_price) * holdings
+        net_worth = balance
+        history.append({
+            'Date': df.iloc[-1]['Date'],
+            'Close': final_price,
+            'Action': 'Sell',
+            'Buy_Signal_Price': np.nan,
+            'Sell_Signal_Price': final_price,
+            'Net Worth': net_worth,
+            'Balance': balance,
+            'Position': 0,
+            'Reward': profit / initial_balance
+        })
+
+    history_df = pd.DataFrame(history)
+    return {'Strategy': 'MACD Crossover', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': profit}, history_df
+
+
+def bollinger_bands_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5):
+    df = df.reset_index(drop=True)
+    balance = initial_balance
+    holdings = 0
+    net_worth = initial_balance
+    history = []
+    buy_price = None
+
+    required_cols = ['BB_Upper', 'BB_Lower', 'Close']
+    if not all(col in df.columns for col in required_cols):
+        return {'Strategy': 'Bollinger Bands', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    df = df.dropna(subset=required_cols)
+    for idx in range(1, len(df)):
+        prev_close = df.iloc[idx - 1]['Close']
+        prev_bb_lower = df.iloc[idx - 1]['BB_Lower']
+        prev_bb_upper = df.iloc[idx - 1]['BB_Upper']
+        current_close = df.iloc[idx]['Close']
+        current_bb_upper = df.iloc[idx]['BB_Upper']
+        current_bb_lower = df.iloc[idx]['BB_Lower']
+        date = df.iloc[idx]['Date']
+
+        if prev_close >= prev_bb_lower and current_close < current_bb_lower:
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / current_close)
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * current_close * (1 + transaction_cost)
+                if total_cost <= balance:
+                    balance -= total_cost
+                    holdings += shares_to_buy
+                    buy_price = current_close
+                    history.append({
+                        'Date': date,
+                        'Close': current_close,
+                        'Action': 'Buy',
+                        'Buy_Signal_Price': current_close,
+                        'Sell_Signal_Price': None,
+                        'Net Worth': balance + holdings * current_close,
+                        'Balance': balance,
+                        'Position': holdings,
+                        'Reward': 0.0
+                    })
+
+        elif prev_close <= prev_bb_upper and current_close > current_bb_upper:
+            if holdings > 0 and buy_price is not None:
+                shares_to_sell = holdings
+                proceeds = shares_to_sell * current_close * (1 - transaction_cost)
+                profit = (current_close - buy_price) * shares_to_sell
+                balance += proceeds
+                net_worth = balance
+                reward = profit / initial_balance
+                holdings = 0
+                history.append({
+                    'Date': date,
+                    'Close': current_close,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': None,
+                    'Sell_Signal_Price': current_close,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+
+    final_price = df.iloc[-1]['Close']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
+    if holdings > 0 and buy_price is not None:
+        shares_to_sell = holdings
+        proceeds = shares_to_sell * final_price * (1 - transaction_cost)
+        profit += (final_price - buy_price) * shares_to_sell
+        balance += proceeds
+        net_worth = balance
+        reward = profit / initial_balance
+        holdings = 0
+        history.append({
+            'Date': df.iloc[-1]['Date'],
+            'Close': final_price,
+            'Action': 'Sell',
+            'Buy_Signal_Price': None,
+            'Sell_Signal_Price': final_price,
+            'Net Worth': net_worth,
+            'Balance': balance,
+            'Position': holdings,
+            'Reward': reward
+        })
+
+    history_df = pd.DataFrame(history)
+    return {'Strategy': 'Bollinger Bands', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': profit}, history_df
+
+
+def random_strategy_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001, max_position_size: float = 0.5):
+    df = df.reset_index(drop=True)
+    balance = initial_balance
+    holdings = 0
+    net_worth = initial_balance
+    history = []
+    buy_price = 0.0
+
+    if 'Close' not in df.columns:
+        return {'Strategy': 'Random Strategy', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': 0.0}, pd.DataFrame()
+
+    df = df.dropna(subset=['Close'])
+    for idx in range(1, len(df)):
+        action = random.choice(['Buy', 'Sell', 'Hold'])
+        close_price = df.iloc[idx]['Close']
+        date = df.iloc[idx]['Date']
+
+        if action == 'Buy':
+            investment_amount = balance * max_position_size
+            shares_to_buy = math.floor(investment_amount / close_price)
+            if shares_to_buy > 0:
+                total_cost = shares_to_buy * close_price * (1 + transaction_cost)
+                if total_cost <= balance:
+                    balance -= total_cost
+                    holdings += shares_to_buy
+                    buy_price = close_price
+                    history.append({
+                        'Date': date,
+                        'Close': close_price,
+                        'Action': 'Buy',
+                        'Buy_Signal_Price': close_price,
+                        'Sell_Signal_Price': np.nan,
+                        'Net Worth': balance + holdings * close_price,
+                        'Balance': balance,
+                        'Position': holdings,
+                        'Reward': 0.0
+                    })
+
+        elif action == 'Sell':
+            if holdings > 0:
+                proceeds = holdings * close_price * (1 - transaction_cost)
+                balance += proceeds
+                profit = (close_price - buy_price) * holdings
+                holdings = 0
+                net_worth = balance
+                reward = profit / initial_balance
+                history.append({
+                    'Date': date,
+                    'Close': close_price,
+                    'Action': 'Sell',
+                    'Buy_Signal_Price': np.nan,
+                    'Sell_Signal_Price': close_price,
+                    'Net Worth': net_worth,
+                    'Balance': balance,
+                    'Position': holdings,
+                    'Reward': reward
+                })
+        else:
+            history.append({
+                'Date': date,
+                'Close': close_price,
+                'Action': 'Hold',
+                'Buy_Signal_Price': np.nan,
+                'Sell_Signal_Price': np.nan,
+                'Net Worth': balance + holdings * close_price,
+                'Balance': balance,
+                'Position': holdings,
+                'Reward': 0.0
+            })
+
+    final_price = df.iloc[-1]['Close']
+    net_worth = balance + holdings * final_price
+    profit = net_worth - initial_balance
+    if holdings > 0:
+        proceeds = holdings * final_price * (1 - transaction_cost)
+        balance += proceeds
+        profit += (final_price - buy_price) * holdings
+        history.append({
+            'Date': df.iloc[-1]['Date'],
+            'Close': final_price,
+            'Action': 'Sell',
+            'Buy_Signal_Price': np.nan,
+            'Sell_Signal_Price': final_price,
+            'Net Worth': balance,
+            'Balance': balance,
+            'Position': 0,
+            'Reward': profit / initial_balance
+        })
+
+    history_df = pd.DataFrame(history)
+    return {'Strategy': 'Random Strategy', 'Initial Balance': initial_balance, 'Final Net Worth': net_worth, 'Profit': profit}, history_df
+
+def plot_rl_training_history(training_history: pd.DataFrame, pdf: PdfPages):
+    if training_history.empty:
+        main_logger.error("RL training history is empty. Cannot plot training history.")
+        return
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+    sns.lineplot(x='Date', y='Net Worth', data=training_history, label='Net Worth')
+    sns.lineplot(x='Date', y='Reward', data=training_history, label='Reward', color='orange')
+    plt.title('RL Agent Training History')
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_reward_movements(test_history: pd.DataFrame, pdf: PdfPages):
+    if test_history.empty:
+        main_logger.error("RL test history is empty. Cannot plot reward movements.")
+        return
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+    sns.lineplot(x='Date', y='Reward', data=test_history, label='Reward', color='green')
+    plt.title('RL Agent Reward Movements Over Test Period')
+    plt.xlabel('Date')
+    plt.ylabel('Reward')
+    plt.legend()
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_position_movements(test_history: pd.DataFrame, pdf: PdfPages):
+    if test_history.empty:
+        main_logger.error("RL test history is empty. Cannot plot position movements.")
+        return
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+    sns.lineplot(x='Date', y='Position', data=test_history, label='Position (Shares)', color='purple')
+    plt.title('RL Agent Position Movements Over Time')
+    plt.xlabel('Date')
+    plt.ylabel('Position (Shares)')
+    plt.legend()
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_drawdown_movements(test_history: pd.DataFrame, pdf: PdfPages):
+    if test_history.empty:
+        main_logger.error("RL test history is empty. Cannot plot drawdown movements.")
+        return
+    net_worth_series = test_history['Net Worth']
+    rolling_max = net_worth_series.cummax()
+    drawdown = (net_worth_series - rolling_max) / rolling_max
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+    sns.lineplot(x=test_history['Date'], y=drawdown, label='Drawdown', color='red')
+    plt.title('RL Agent Drawdown Movements Over Time')
+    plt.xlabel('Date')
+    plt.ylabel('Drawdown')
+    plt.legend()
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+def plot_all_buy_sell_signals(strategy_history: dict, pdf: PdfPages):
+    for strategy, history_df in strategy_history.items():
+        if history_df.empty:
+            continue
+        plt.figure(figsize=(14, 7))
+        sns.set_style("darkgrid")
+        dates = history_df['Date']
+        close_prices = history_df['Close']
+        plt.plot(dates, close_prices, label='Close Price', color='blue')
+
+        buy_signals = history_df[history_df['Action'] == 'Buy']
+        sell_signals = history_df[history_df['Action'] == 'Sell']
+        plt.scatter(buy_signals['Date'], buy_signals['Close'], marker='^', color='green', label='Buy Signal', alpha=1)
+        plt.scatter(sell_signals['Date'], sell_signals['Close'], marker='v', color='red', label='Sell Signal', alpha=1)
+
+        plt.title(f'{strategy} - Buy and Sell Signals on Test Data')
+        plt.xlabel('Date')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
+
+
+def plot_profit_comparison(strategy_results: list, pdf: PdfPages):
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+    strategies = [result[0]['Strategy'] for result in strategy_results]
+    profits = [result[0]['Profit'] for result in strategy_results]
+    sns.barplot(x=strategies, y=profits, palette='viridis')
+    plt.title('Profit Comparison Among Strategies')
+    plt.xlabel('Strategy')
+    plt.ylabel('Profit ($)')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_transaction_count(strategy_results: list, pdf: PdfPages):
+    transaction_counts = []
+    strategies = []
+    for result, history_df in strategy_results:
+        if history_df.empty:
+            count = 0
+        else:
+            count = history_df['Action'].value_counts().get('Buy', 0) + history_df['Action'].value_counts().get('Sell', 0)
+        transaction_counts.append(count)
+        strategies.append(result['Strategy'])
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+    sns.barplot(x=strategies, y=transaction_counts, palette='magma')
+    plt.title('Transaction Count per Strategy')
+    plt.xlabel('Strategy')
+    plt.ylabel('Number of Transactions')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_cash_balance(strategy_results: list, pdf: PdfPages):
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+    strategies = [result[0]['Strategy'] for result in strategy_results]
+    net_worths = [result[0]['Final Net Worth'] for result in strategy_results]
+    sns.barplot(x=strategies, y=net_worths, palette='coolwarm')
+    plt.title('Final Net Worth per Strategy')
+    plt.xlabel('Strategy')
+    plt.ylabel('Net Worth ($)')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_transaction_costs(strategy_results: list, pdf: PdfPages):
+    transaction_costs = []
+    strategies = []
+    for result, history_df in strategy_results:
+        if history_df.empty:
+            cost = 0.0
+        else:
+            buys = history_df[history_df['Action'] == 'Buy']
+            sells = history_df[history_df['Action'] == 'Sell']
+            cost = (buys.shape[0] + sells.shape[0]) * 0.001  # naive approach
+        transaction_costs.append(cost)
+        strategies.append(result['Strategy'])
+    plt.figure(figsize=(10, 6))
+    sns.set_style("whitegrid")
+    sns.barplot(x=strategies, y=transaction_costs, palette='inferno')
+    plt.title('Transaction Costs per Strategy')
+    plt.xlabel('Strategy')
+    plt.ylabel('Transaction Costs ($)')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+def plot_comparison(test_df: pd.DataFrame, rl_test_df: pd.DataFrame, strategy_results: list, initial_balance: float, ticker: str, pdf: PdfPages):
+    plt.figure(figsize=(14, 7))
+    sns.set_style("darkgrid")
+    if not rl_test_df.empty:
+        sns.lineplot(x='Date', y='Net Worth', data=rl_test_df, label='RL Agent', color='blue')
+    for result, history_df in strategy_results:
+        if history_df.empty:
+            continue
+        sns.lineplot(x='Date', y='Net Worth', data=history_df, label=result['Strategy'])
+    plt.title('RL Agent vs Baseline Strategies - Net Worth Comparison')
+    plt.xlabel('Date')
+    plt.ylabel('Net Worth ($)')
+    plt.legend()
+    plt.tight_layout()
+    pdf.savefig()
+    plt.close()
+
+
+class EarlyStoppingCallback(BaseCallback):
+    def __init__(self, monitor='train/reward_env', patience=20, min_delta=1e-5, verbose=1):
+        super(EarlyStoppingCallback, self).__init__(verbose)
+        self.monitor = monitor
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_reward = -np.inf
+        self.wait = 0
+
+    def _on_step(self) -> bool:
+        current_reward = self.logger.name_to_value.get(self.monitor, None)
+        if current_reward is None:
+            if self.verbose > 0:
+                print(f"EarlyStoppingCallback: Metric '{self.monitor}' not found.")
+            return True
+        if current_reward > self.best_reward + self.min_delta:
+            self.best_reward = current_reward
+            self.wait = 0
+            if self.verbose > 0:
+                print(f"EarlyStoppingCallback: Reward improved to {self.best_reward:.4f}. Resetting wait counter.")
+        else:
+            self.wait += 1
+            if self.verbose > 0:
+                print(f"EarlyStoppingCallback: No improvement in reward. Wait counter: {self.wait}/{self.patience}")
+            if self.wait >= self.patience:
+                if self.verbose > 0:
+                    print("EarlyStoppingCallback: Patience exceeded. Stopping training.")
+                return False
+        return True
+
+
+class CustomTensorboardCallback(BaseCallback):
+    def __init__(self, verbose=0, window_size=100):
+        super(CustomTensorboardCallback, self).__init__(verbose)
+        self.window_size = window_size
+        self.rewards_buffer = []
+        self.start_time = None
+
+    def _on_training_start(self) -> None:
+        self.start_time = time.time()
+
+    def _on_step(self) -> bool:
+        env = self.training_env.envs[0]
+        if hasattr(env, 'history') and env.history:
+            last_step = env.history[-1]
+            recent_reward = last_step.get('Reward', 0.0)
+            self.rewards_buffer.append(recent_reward)
+            if len(self.rewards_buffer) > self.window_size:
+                self.rewards_buffer.pop(0)
+            rolling_avg_reward = np.mean(self.rewards_buffer)
+            self.logger.record("train/reward_env", rolling_avg_reward)
+            self.logger.record("train/net_worth_env", last_step.get('Net Worth', 0.0))
+            self.logger.record("train/balance_env", last_step.get('Balance', 0.0))
+            self.logger.record("train/position_env", last_step.get('Position', 0.0))
+
+        if self.start_time:
+            elapsed_time = time.time() - self.start_time
+            formatted_time = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
+            self.logger.record("train/elapsed_time_env", elapsed_time)
+            self.logger.record("train/elapsed_time_formatted_env", formatted_time)
+        return True
+
+    def _on_training_end(self) -> None:
+        env = self.training_env.envs[0]
+        if hasattr(env, 'history') and env.history:
+            self.logger.record("train/final_net_worth", env.history[-1].get('Net Worth', 0.0))
+            self.logger.record("train/final_reward", sum(h['Reward'] for h in env.history))
+            self.logger.record("train/final_balance", env.history[-1].get('Balance', 0.0))
+            self.logger.record("train/final_position", env.history[-1].get('Position', 0.0))
+            rewards_slice = [step.get('Reward', 0.0) for step in env.history[-self.window_size:]]
+            final_rolling_avg = np.mean(rewards_slice) if rewards_slice else 0.0
+            self.logger.record("train/final_rolling_avg_reward", final_rolling_avg)
+        else:
+            self.logger.record("train/final_net_worth", 0.0)
+            self.logger.record("train/final_reward", 0.0)
+            self.logger.record("train/final_balance", 0.0)
+            self.logger.record("train/final_position", 0.0)
+            self.logger.record("train/final_rolling_avg_reward", 0.0)
+
+def calculate_max_drawdown(net_worth_series: pd.Series) -> float:
+    rolling_max = net_worth_series.cummax()
+    drawdown = (net_worth_series - rolling_max) / rolling_max
+    return drawdown.min()
+
+def calculate_annualized_return(net_worth_series: pd.Series, periods_per_year: int = 252) -> float:
+    start_value = net_worth_series.iloc[0]
+    end_value = net_worth_series.iloc[-1]
+    num_periods = len(net_worth_series)
+    if num_periods == 0:
+        return 0.0
+    return (end_value / start_value) ** (periods_per_year / num_periods) - 1
+
+def generate_unique_study_name(base_name='rl_trading_agent_study'):
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{base_name}_{timestamp}"
+
+def objective(
+    trial,
+    train_tickers: list,
+    initial_balance: float,
+    stop_loss: float,
+    take_profit: float,
+    max_position_size: float,
+    max_drawdown: float,
+    annual_trading_days: int,
+    transaction_cost: float
+):
+    """
+    Builds a DummyVecEnv from multiple SingleStockTradingEnv instances (one per ticker),
+    applies the trial's hyperparams, trains a PPO model, then does a quick test rollout
+    on the same environment to measure a final reward.
+
+    :param trial: Optuna trial object for hyperparam sampling.
+    :param train_tickers: List of ticker symbols to train on simultaneously.
+    :param initial_balance: Starting balance for each environment.
+    :param stop_loss: E.g. 0.90 means 10% stop loss.
+    :param take_profit: E.g. 1.10 means 10% profit target.
+    :param max_position_size: Max fraction of portfolio used per trade.
+    :param max_drawdown: E.g. 0.20 means 20% max drawdown limit.
+    :param annual_trading_days: Typically 252 for stock markets.
+    :param transaction_cost: E.g. 0.001 => 0.1% cost per trade.
+    :return: A float representing the objective metric (reward) to maximize.
+    """
+    import math
+    import numpy as np
+    import torch
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    # 1) Build environment list
+    env_factories = []
+    for i, ticker in enumerate(train_tickers):
+        df_full = get_data(ticker,"2018-01-01", "2025-02-05")
+        if df_full.empty:
+            continue
+        split_idx = int(len(df_full) * 0.8)
+        df_train = df_full.iloc[:split_idx].copy()
+        if df_train.empty:
+            continue
+
+        env_instance = SingleStockTradingEnv(
+            df=df_train,
+            initial_balance=initial_balance,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            max_position_size=max_position_size,
+            max_drawdown=max_drawdown,
+            annual_trading_days=annual_trading_days,
+            transaction_cost=transaction_cost,
+            env_rank=i,
+            some_factor=trial.suggest_float("drawdown_penalty_factor", 0.0001, 1.0, log=True),
+            hold_threshold=0.1,
+            reward_weights={
+                'reward_scale': trial.suggest_float('reward_scale', 0.5, 2.0),
+                'profit_weight': 1.5,
+                'sharpe_bonus_weight': 0.05,
+                'transaction_penalty_weight': 1e-3,
+                'holding_bonus_weight': 0.001,
+                'transaction_penalty_scale': 1.0,
+                'volatility_threshold': 1.0,
+                'momentum_threshold_min': 30,
+                'momentum_threshold_max': 70
+            }
+        )
+        #print(f"DEBUG Created SingleStockTradingEnv rank={i} from line {__file__}.")
+        #training_logger.debug(f"DEBUG Created SingleStockTradingEnv rank={i} from line {__file__}.")
+
+        env_factories.append(lambda e=env_instance: e)
+
+    if not env_factories:
+        # If no data or empty envs, return negative infinity to "fail" the trial
+        return -math.inf
+
+    # 2) Create DummyVecEnv + VecNormalize
+    vec_env_train = DummyVecEnv(env_factories)
+    vec_env_train = VecNormalize(vec_env_train, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
+    # 3) Suggest hyperparams for PPO
+    learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-3)
+    n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
+    batch_size = trial.suggest_categorical('batch_size', [32, 64])
+    gamma = trial.suggest_uniform('gamma', 0.98, 0.999)
+    gae_lambda = trial.suggest_uniform('gae_lambda', 0.80, 1.00)
+    clip_range = trial.suggest_uniform('clip_range', 0.1, 0.3)
+    ent_coef = trial.suggest_loguniform('ent_coef', 1e-4, 1e-1)
+    vf_coef = trial.suggest_uniform('vf_coef', 0.1, 0.5)
+    max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.5, 1.0)
+
+    net_arch_str = trial.suggest_categorical('net_arch', ['128_128', '256_256', '128_256_128'])
+    net_arch_list = [int(x) for x in net_arch_str.split('_')]
+
+    policy_kwargs = dict(
+        activation_fn=torch.nn.ReLU,
+        net_arch=net_arch_list
+    )
+
+    # 4) Initialize PPO and train
+    model = PPO(
+        'MlpPolicy',
+        vec_env_train,
+        verbose=0,
+        seed=42,
+        policy_kwargs=policy_kwargs,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
+        clip_range=clip_range,
+        ent_coef=ent_coef,
+        vf_coef=vf_coef,
+        max_grad_norm=max_grad_norm,
+        tensorboard_log=None,
+        device='cuda'
+    )
+
+    total_timesteps = 50_000
+    model.learn(total_timesteps=total_timesteps)
+
+    # 5) Test (rollout) on the same environment to get a final reward measure
+    # Turn off training for rollout
+    vec_env_train.training = False
+    vec_env_train.norm_reward = False
+
+    # We'll do a few episodes of inference
+    num_episodes_to_run = 2
+    all_episode_rewards = []
+
+    for _ in range(num_episodes_to_run):
+        obs = vec_env_train.reset()
+        done = [False] * vec_env_train.num_envs
+        #truncated = [False] * vec_env_train.num_envs
+        ep_rewards = np.zeros(vec_env_train.num_envs, dtype=np.float64)
+
+        while not all(done):
+            action, _ = model.predict(obs, deterministic=True)
+            training_logger.debug(
+                f"[Objective Loop] predicted action={action}, "
+                f"type={type(action)}, "
+                f"shape={(action.shape if hasattr(action, 'shape') else None)}"
+            )
+
+            obs, rewards, done, infos = vec_env_train.step(action)
+            ep_rewards += rewards  # accumulate step rewards
+
+        # We have ep_rewards for each sub-environment
+        all_episode_rewards.extend(ep_rewards)
+
+    # The final metric: average reward across envs and episodes
+    if len(all_episode_rewards) == 0:
+        cumulative_reward = -math.inf
+    else:
+        cumulative_reward = float(np.mean(all_episode_rewards))
+
+    return cumulative_reward
+
+
+
+if __name__ == "__main__":
+    main_logger.info("Starting pipeline for multi‐ticker training (ITC, APOLLOTYRE) and single‐ticker testing (GRINDWELL).")
+
+    # ----------------------------------------------------------------
+    # 1. Function to read CSV from 'data/' and parse indicators
+    # ----------------------------------------------------------------
+    def get_data(
+        ticker: str,
+        start_date: str,
+        end_date: str
+    ) -> pd.DataFrame:
+        main_logger.info(f"Fetching data from yfinance for ticker {ticker} between {start_date} and {end_date}")
+        try:
+            df = yf.download(ticker, start=start_date, end=end_date)
+            if df.empty:
+                main_logger.error(f"No data fetched from yfinance for ticker {ticker}")
+                return pd.DataFrame()
+            df.reset_index(inplace=True)
+        except Exception as e:
+            main_logger.error(f"Error fetching data from yfinance for ticker {ticker}: {e}")
+            return pd.DataFrame()
+
+        required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        for col in required_columns:
+            if col not in df.columns:
+                main_logger.error(f"Missing required column '{col}' in fetched data for ticker {ticker}.")
+                return pd.DataFrame()
+
+        df.to_csv(RESULTS_DIR / "data_fetched_yfinance.csv", index=True)
+        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+
+        if len(df) < 200:
+            main_logger.error("Not enough data points fetched from yfinance.")
+            return pd.DataFrame()
+
+        close = df['Close'].squeeze()
+        high = df['High'].squeeze()
+        low = df['Low'].squeeze()
+        volume_col = df['Volume'].squeeze()
+
+        sma10 = trend.SMAIndicator(close=close, window=10).sma_indicator()
+        sma50 = trend.SMAIndicator(close=close, window=50).sma_indicator()
+        rsi = momentum.RSIIndicator(close=close, window=14).rsi()
+        macd = trend.MACD(close=close).macd()
+        adx = trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
+        bollinger = volatility.BollingerBands(close=close, window=20, window_dev=2)
+        bb_upper = bollinger.bollinger_hband()
+        bb_lower = bollinger.bollinger_lband()
+        bollinger_width = bollinger.bollinger_wband()
+        ema20 = trend.EMAIndicator(close=close, window=20).ema_indicator()
+        vwap = volume.VolumeWeightedAveragePrice(
+            high=high, low=low, close=close,
+            volume=volume_col, window=14
+        ).volume_weighted_average_price()
+        lagged_return = close.pct_change().fillna(0)
+        atr = volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+
+        df['SMA10'] = sma10
+        df['SMA50'] = sma50
+        df['RSI'] = rsi
+        df['MACD'] = macd
+        df['ADX'] = adx
+        df['BB_Upper'] = bb_upper
+        df['BB_Lower'] = bb_lower
+        df['Bollinger_Width'] = bollinger_width
+        df['EMA20'] = ema20
+        df['VWAP'] = vwap
+        df['Lagged_Return'] = lagged_return
+        df['Volatility'] = atr
+
+        df.to_csv(RESULTS_DIR / "data_with_indicators.csv", index=True)
+
+        df.fillna(method='ffill', inplace=True)
+        df.fillna(0, inplace=True)
+        df.reset_index(inplace=True)
+
+        return df
+
+
+    # ----------------------------------------------------------------
+    # 2. Create multiple training envs (ITC, APOLLOTYRE) via DummyVecEnv
+    # ----------------------------------------------------------------
+    train_tickers = ["ITC.NS", "APOLLOTYRE.NS"]
+    train_envs = []
+    for i, ticker in enumerate(train_tickers):
+        df_full = get_data(ticker, "2018-01-01", "2025-02-05")
+        if df_full.empty:
+            main_logger.warning(f"No data for {ticker}, skipping.")
+            continue
+
+        # 80% train, 20% hold-out (not used here, but you could do so if needed)
+        split_idx = int(len(df_full) * 0.8)
+        df_train = df_full.iloc[:split_idx].reset_index(drop=True)
+        if df_train.empty:
+            main_logger.warning(f"Training portion is empty for {ticker}, skipping.")
+            continue
+
+        env_instance = SingleStockTradingEnv(
+            df=df_train,
+            initial_balance=100000,
+            stop_loss=0.90,
+            take_profit=1.10,
+            max_position_size=0.5,
+            max_drawdown=0.20,
+            annual_trading_days=252,
+            transaction_cost=0.001,
+            env_rank=i,
+            some_factor=0.01,
+            hold_threshold=0.1,
+            reward_weights={
+                'reward_scale': 1.0,
+                'profit_weight': 1.5,
+                'sharpe_bonus_weight': 0.05,
+                'transaction_penalty_weight': 1e-3,
+                'holding_bonus_weight': 0.001,
+                'transaction_penalty_scale': 1.0,
+                'volatility_threshold': 1.0,
+                'momentum_threshold_min': 30,
+                'momentum_threshold_max': 70
+            }
+        )
+        # For DummyVecEnv, pass a function returning the env
+        train_envs.append(lambda e=env_instance: e)
+
+    if not train_envs:
+        main_logger.critical("No training environments created. Exiting.")
+        exit()
+
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    vec_env_train = DummyVecEnv(train_envs)
+
+    # One global scaler for all sub-envs
+    vec_env_train = VecNormalize(vec_env_train, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
+    # ----------------------------------------------------------------
+    # 3. Prepare single ticker (GRINDWELL) for final testing
+    # ----------------------------------------------------------------
+    test_ticker = "GRINDWELL.NS"
+    df_test_full = get_data(test_ticker,"2018-01-01", "2025-02-05")
+    if df_test_full.empty:
+        main_logger.error(f"No data for test ticker {test_ticker}. Exiting.")
+        exit()
+
+    split_idx_test = int(len(df_test_full) * 0.8)
+    test_df = df_test_full.iloc[split_idx_test:].reset_index(drop=True)
+    main_logger.info(f"{test_ticker} test portion rows = {len(test_df)}")
+
+    # ----------------------------------------------------------------
+    # 4. Basic config + Setup Optuna
+    # ----------------------------------------------------------------
+    INITIAL_BALANCE = 100000
+    STOP_LOSS = 0.90
+    TAKE_PROFIT = 1.10
+    MAX_POSITION_SIZE = 0.5
+    MAX_DRAWDOWN = 0.20
+    ANNUAL_TRADING_DAYS = 252
+    TRANSACTION_COST = 0.001
+
+    storage = optuna.storages.RDBStorage(
+        url='sqlite:///optuna_study.db',
+        engine_kwargs={'connect_args': {'check_same_thread': False}}
+    )
+    unique_study_name = generate_unique_study_name()
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED),
+        storage=storage,
+        study_name=unique_study_name,
+        load_if_exists=False
+    )
+
+    n_trials = 5
+    main_logger.info(f"Starting Optuna study for {n_trials} trials with multiple training envs.")
+
+    # NOTE: remove the "env_info" param from the objective call
+    #       so it matches your objective function signature
+    study.optimize(
+        lambda trial: objective(
+            trial,
+            train_tickers=["ITC.NS", "APOLLOTYRE.NS"],
+            initial_balance=100000,
+            stop_loss=0.90,
+            take_profit=1.10,
+            max_position_size=0.5,
+            max_drawdown=0.20,
+            annual_trading_days=252,
+            transaction_cost=0.001
+        ),
+        n_trials=5,
+        n_jobs=-1
+    )
+
+    if study.best_params:
+        best_params = study.best_params
+        main_logger.info(f"[OPTUNA] Best hyperparameters: {best_params}")
+    else:
+        main_logger.critical("No successful trials found.")
+        exit()
+
+    # ----------------------------------------------------------------
+    # 5. Final training pass with best hyperparams
+    # ----------------------------------------------------------------
+    main_logger.info("Final training pass with best hyperparams from Optuna.")
+
+    # Recreate sub‐env for each ticker, but now using best_params
+    final_envs = []
+    for i, ticker in enumerate(train_tickers):
+        df_full = get_data(ticker)
+        if df_full.empty:
+            continue
+        split_idx = int(len(df_full) * 0.8)
+        df_train = df_full.iloc[:split_idx].reset_index(drop=True)
+
+        env_instance = SingleStockTradingEnv(
+            df=df_train,
+            initial_balance=INITIAL_BALANCE,
+            stop_loss=best_params.get('stop_loss', STOP_LOSS),
+            take_profit=best_params.get('take_profit', TAKE_PROFIT),
+            max_position_size=best_params.get('max_position_size', MAX_POSITION_SIZE),
+            max_drawdown=best_params.get('max_drawdown', MAX_DRAWDOWN),
+            annual_trading_days=ANNUAL_TRADING_DAYS,
+            transaction_cost=best_params.get('transaction_cost', TRANSACTION_COST),
+            env_rank=1000 + i,
+            some_factor=best_params.get('drawdown_penalty_factor', 0.01),
+            hold_threshold=best_params.get('hold_threshold', 0.1),
+            reward_weights={
+                'reward_scale': best_params.get('reward_scale', 1.0),
+                'profit_weight': best_params.get('profit_weight', 1.5),
+                'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
+                'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
+                'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
+                'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
+                'volatility_threshold': best_params.get('volatility_threshold', 1.0),
+                'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
+                'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
+            }
+        )
+        final_envs.append(lambda e=env_instance: e)
+
+    vec_env_final = DummyVecEnv(final_envs)
+    vec_env_final = VecNormalize(vec_env_final, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
+    net_arch_str = best_params.get('net_arch', '128_128')
+    net_arch_list = [int(x) for x in net_arch_str.split('_')]
+    policy_kwargs = dict(
+        activation_fn=torch.nn.ReLU,
+        net_arch=net_arch_list
+    )
+
+    model_final = PPO(
+        "MlpPolicy",
+        vec_env_final,
+        verbose=1,
+        seed=RANDOM_SEED,
+        policy_kwargs=policy_kwargs,
+        learning_rate=best_params.get('learning_rate', 1e-4),
+        n_steps=best_params.get('n_steps', 256),
+        batch_size=best_params.get('batch_size', 64),
+        gamma=best_params.get('gamma', 0.99),
+        gae_lambda=best_params.get('gae_lambda', 0.95),
+        clip_range=best_params.get('clip_range', 0.2),
+        ent_coef=best_params.get('ent_coef', 0.01),
+        vf_coef=best_params.get('vf_coef', 0.5),
+        max_grad_norm=best_params.get('max_grad_norm', 0.5),
+        tensorboard_log=str(TB_LOG_DIR / "final_model")
+    )
+
+    total_timesteps = 300000
+    main_logger.info(f"Learning final model for {total_timesteps} timesteps with multiple tickers.")
+    model_final.learn(total_timesteps=total_timesteps)
+    model_final.save("ppo_final_model.zip")
+    vec_env_final.save("vec_normalize.pkl")
+    main_logger.info("Final multi‐ticker model + VecNormalize saved.")
+
+    # ----------------------------------------------------------------
+    # 6. Test on single ticker (GRINDWELL) with saved normalization
+    # ----------------------------------------------------------------
+    main_logger.info(f"Testing final model on ticker {test_ticker} with {len(test_df)} rows of data.")
+
+    env_test = SingleStockTradingEnv(
+        df=test_df,
+        initial_balance=INITIAL_BALANCE,
+        stop_loss=best_params.get('stop_loss', STOP_LOSS),
+        take_profit=best_params.get('take_profit', TAKE_PROFIT),
+        max_position_size=best_params.get('max_position_size', MAX_POSITION_SIZE),
+        max_drawdown=best_params.get('max_drawdown', MAX_DRAWDOWN),
+        annual_trading_days=ANNUAL_TRADING_DAYS,
+        transaction_cost=best_params.get('transaction_cost', TRANSACTION_COST),
+        env_rank=9999,
+        some_factor=best_params.get('drawdown_penalty_factor', 0.01),
+        hold_threshold=best_params.get('hold_threshold', 0.1),
+        reward_weights={
+            'reward_scale': best_params.get('reward_scale', 1.0),
+            'profit_weight': best_params.get('profit_weight', 1.5),
+            'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
+            'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
+            'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
+            'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
+            'volatility_threshold': best_params.get('volatility_threshold', 1.0),
+            'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
+            'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
+        }
+    )
+
+    test_vec = DummyVecEnv([lambda: env_test])
+    # Load saved normalization stats
+    test_vec = VecNormalize.load("vec_normalize.pkl", test_vec)
+    test_vec.training = False
+    test_vec.norm_reward = False
+
+    # Load the final PPO model
+    loaded_model = PPO.load("ppo_final_model.zip", env=test_vec)
+
+    obs, _ = env_test.reset()
+    done = False
+    truncated = False
+    while not done:
+        action, _ = loaded_model.predict(obs, deterministic=True)
+        training_logger.debug(
+            f"[Main Loop] predicted action={action}, "
+            f"type={type(action)}, "
+            f"shape={(action.shape if hasattr(action, 'shape') else None)}"
+        )
+        obs, reward, done, info = env_test.step(action)
+
+    if env_test.history:
+        final_net_worth = env_test.history[-1]["Net Worth"]
+        main_logger.info(f"Test complete on {test_ticker}. Final net worth: ${final_net_worth:.2f}")
+    else:
+        main_logger.warning("No test history recorded.")
