@@ -27,6 +27,7 @@ import optuna
 import joblib
 import time
 import plotly.io as pio
+import traceback
 
 try:
     from concurrent_log_handler import ConcurrentRotatingFileHandler
@@ -53,7 +54,7 @@ def setup_logger(name: str, log_file: Path, level=logging.INFO) -> logging.Logge
     logger = logging.getLogger(name)
     logger.setLevel(level)
     if not logger.handlers:
-        handler = ConcurrentRotatingFileHandler(str(log_file), maxBytes=10**6, backupCount=5, encoding='utf-8')
+        handler = ConcurrentRotatingFileHandler(str(log_file), maxBytes=10**6, backupCount=10, encoding='utf-8')
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
@@ -108,6 +109,7 @@ class SingleStockTradingEnv(gym.Env):
     def __init__(
         self,
         df: pd.DataFrame,
+        ticker: str,
         initial_balance: float = 100000,
         stop_loss: float = 0.90,
         take_profit: float = 1.10,
@@ -126,6 +128,7 @@ class SingleStockTradingEnv(gym.Env):
     ):
         super(SingleStockTradingEnv, self).__init__()
         self.env_rank = env_rank
+        self.ticker = ticker
         self.df = df.copy().reset_index(drop=True)
 
         self.initial_balance = initial_balance
@@ -430,7 +433,7 @@ class SingleStockTradingEnv(gym.Env):
 
         raw_reward = reward
         self.reward_history.append(raw_reward)
-        if len(self.reward_history) > 50:
+        """ if len(self.reward_history) > 50:
             local_std = np.std(self.reward_history)
             if local_std < 1e-6:
                 local_std = 1
@@ -439,11 +442,10 @@ class SingleStockTradingEnv(gym.Env):
         else:
             scaled_reward = math.tanh(float(raw_reward) / 10)
 
-        scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
+        scaled_reward *= self.reward_weights.get('reward_scale', 1.0) """
         normalized_reward = float(raw_reward)
 
-        #normalized_reward = reward
-
+        #normalized_reward = reward      
         self.history.append({
             'Date': current_date,
             'Close': current_price,
@@ -454,25 +456,29 @@ class SingleStockTradingEnv(gym.Env):
             'Balance': self.balance,
             'Position': self.position,
             'Reward': normalized_reward,   
-            'raw_reward': raw_reward,         
-            'Trade_Cost': trade_cost
+            #'raw_reward': raw_reward,         
+            'Trade_Cost': trade_cost            
         })
 
         # --- Revised Termination Condition ---
-        # Ensure a minimum number of steps before termination.
+        # Ensure a minimum number of steps before termination.                
         MIN_STEPS = 10
         if self.current_step >= MIN_STEPS:
             if net_worth <= 0:
                 terminated = True
                 normalized_reward -= 10.0
-            # Terminate if we have reached the end of the data or exceeded max_episode_steps.
-            elif self.current_step >= self.max_episode_steps or self.current_step >= len(self.df) - 1:
+            elif self.current_step >= len(self.df) - 1:
+                terminated = True
+            elif self.current_step >= self.max_episode_steps:
                 terminated = True
             else:
                 terminated = False
         else:
             terminated = False
-        truncated = False
+
+        # Always set truncated after the termination check.
+        truncated = False        
+
         # --------------------------------------
         # When the episode terminates, capture final metrics.
         if terminated:
@@ -489,9 +495,13 @@ class SingleStockTradingEnv(gym.Env):
         if not terminated:
             self.prev_net_worth = net_worth
             self.current_step += 1
+        
+        training_logger.debug(f"[Env {self.env_rank}] Updated current_step: {self.current_step} / {len(self.df)}")
         self.current_step = min(self.current_step, len(self.df) - 1)
 
         obs = self._next_observation()
+        if self.history and "Observation" not in self.history[-1]:
+            self.history[-1]["Observation"] = obs
         return obs, normalized_reward, terminated, truncated, {}
 
 def buy_and_hold_with_iloc(df: pd.DataFrame, initial_balance: float = 100000, transaction_cost: float = 0.001):
@@ -1090,34 +1100,60 @@ def plot_comparison(test_df: pd.DataFrame, rl_test_df: pd.DataFrame, strategy_re
 
 
 class EarlyStoppingCallback(BaseCallback):
-    def __init__(self, monitor='train/reward_env', patience=20, min_delta=1e-5, verbose=1):
+    def __init__(self, monitor='train/reward_env', patience=200, min_delta=1e-5, verbose=1, trial_id=None):
+        """
+        Args:
+            monitor (str): Name of the metric to monitor.
+            patience (int): Number of steps with no improvement after which training will be stopped.
+            min_delta (float): Minimum change in the monitored metric to qualify as an improvement.
+            verbose (int): Verbosity mode.
+            trial_id: Identifier for the current trial (e.g., trial.number) for logging purposes.
+        """
         super(EarlyStoppingCallback, self).__init__(verbose)
         self.monitor = monitor
         self.patience = patience
         self.min_delta = min_delta
         self.best_reward = -np.inf
         self.wait = 0
+        self.trial_id = trial_id
 
     def _on_step(self) -> bool:
+        # Retrieve the current value of the monitored metric
         current_reward = self.logger.name_to_value.get(self.monitor, None)
+        
+        # Retrieve additional attributes from the first sub-environment:
+        current_steps = self.training_env.get_attr("current_step", indices=0)
+        env_ids = self.training_env.get_attr("env_rank", indices=0)
+        # If you want to log the ticker, ensure your environment sets self.ticker.
+        tickers = self.training_env.get_attr("ticker", indices=0)
+        
         if current_reward is None:
             if self.verbose > 0:
-                print(f"EarlyStoppingCallback: Metric '{self.monitor}' not found.")
+                training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: Metric '{self.monitor}' not found. "
+                      f"Env current_steps: {current_steps}, Env IDs: {env_ids}, Tickers: {tickers}")
             return True
+
+        # Log the current state details
+        if self.verbose > 0:
+            training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: current_reward = {current_reward:.4f}, "
+                  f"best_reward = {self.best_reward:.4f}, wait = {self.wait}/{self.patience}. "
+                  f"Env current_steps: {current_steps}, Env IDs: {env_ids}, Tickers: {tickers}")
+
         if current_reward > self.best_reward + self.min_delta:
             self.best_reward = current_reward
             self.wait = 0
             if self.verbose > 0:
-                print(f"EarlyStoppingCallback: Reward improved to {self.best_reward:.4f}. Resetting wait counter.")
+                training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: Reward improved to {self.best_reward:.4f}. Resetting wait counter.")
         else:
             self.wait += 1
             if self.verbose > 0:
-                print(f"EarlyStoppingCallback: No improvement in reward. Wait counter: {self.wait}/{self.patience}")
+                training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: No improvement in reward. Wait counter: {self.wait}/{self.patience}")
             if self.wait >= self.patience:
                 if self.verbose > 0:
-                    print("EarlyStoppingCallback: Patience exceeded. Stopping training.")
+                    training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: Patience exceeded. Stopping training.")
                 return False
         return True
+
 
 
 class CustomTensorboardCallback(BaseCallback):
@@ -1144,6 +1180,20 @@ class CustomTensorboardCallback(BaseCallback):
             self.logger.record("train/net_worth_env", last_step.get('Net Worth', 0.0))
             self.logger.record("train/balance_env", last_step.get('Balance', 0.0))
             self.logger.record("train/position_env", last_step.get('Position', 0.0))
+            
+            # EXTRA: Log additional environment attributes.
+            # Retrieve env_rank, ticker, current_step, and the dataframe lengths from the first sub-environment.
+            env_ids = self.training_env.get_attr("env_rank", indices=0)
+            tickers = self.training_env.get_attr("ticker", indices=0)
+            current_steps = self.training_env.get_attr("current_step", indices=0)
+            dataframes = self.training_env.get_attr("df", indices=0)
+            df_lengths = [len(df) for df in dataframes] if dataframes is not None else "Unknown"
+            self.logger.record("train/env_ids", str(env_ids))
+            self.logger.record("train/tickers", str(tickers))
+            self.logger.record("train/current_steps", str(current_steps))
+            self.logger.record("train/data_lengths", str(df_lengths))
+        
+        # Record elapsed time (optional)
         if self.start_time:
             elapsed_time = time.time() - self.start_time
             formatted_time = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
@@ -1152,6 +1202,7 @@ class CustomTensorboardCallback(BaseCallback):
         return True
 
     def _on_training_end(self) -> None:
+        # Retrieve history from the first sub-environment
         histories = self.training_env.get_attr('history', indices=0)
         if histories and histories[0]:
             last_step = histories[0][-1]
@@ -1164,12 +1215,10 @@ class CustomTensorboardCallback(BaseCallback):
                 if isinstance(r, (int, float)):
                     valid_rewards.append(r)
                 else:
-                    # If the reward is not numeric, log a warning and use 0.0.
                     self.logger.record("train/non_numeric_reward_detected", str(r))
                     valid_rewards.append(0.0)
             total_reward = sum(valid_rewards)
             self.logger.record("train/final_reward", total_reward)
-            
             self.logger.record("train/final_balance", last_step.get('Balance', 0.0))
             self.logger.record("train/final_position", last_step.get('Position', 0.0))
             if valid_rewards:
@@ -1177,14 +1226,23 @@ class CustomTensorboardCallback(BaseCallback):
             else:
                 final_rolling_avg = 0.0
             self.logger.record("train/final_rolling_avg_reward", final_rolling_avg)
+            
+            # EXTRA: Log additional final attributes from the first sub-environment
+            env_ids = self.training_env.get_attr("env_rank", indices=0)
+            tickers = self.training_env.get_attr("ticker", indices=0)
+            current_steps = self.training_env.get_attr("current_step", indices=0)
+            dataframes = self.training_env.get_attr("df", indices=0)
+            df_lengths = [len(df) for df in dataframes] if dataframes is not None else "Unknown"
+            self.logger.record("train/final_env_ids", str(env_ids))
+            self.logger.record("train/final_tickers", str(tickers))
+            self.logger.record("train/final_current_steps", str(current_steps))
+            self.logger.record("train/final_data_lengths", str(df_lengths))
         else:
             self.logger.record("train/final_net_worth", 0.0)
             self.logger.record("train/final_reward", 0.0)
             self.logger.record("train/final_balance", 0.0)
             self.logger.record("train/final_position", 0.0)
             self.logger.record("train/final_rolling_avg_reward", 0.0)
-
-
 
 def calculate_max_drawdown(net_worth_series: pd.Series) -> float:
     rolling_max = net_worth_series.cummax()
@@ -1217,12 +1275,12 @@ def objective(
     import math
     import numpy as np
     import torch
+    import pandas as pd
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
     from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
-    import pandas as pd
 
-    # === Define PPO Hyperparameters (as before) ===
+    # === Define PPO Hyperparameters ===
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-3)
     n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
     batch_size = trial.suggest_categorical('batch_size', [32, 64])
@@ -1234,7 +1292,7 @@ def objective(
     max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.5, 1.0)
     net_arch_str = trial.suggest_categorical('net_arch', ['128_128', '256_256', '128_256_128'])
     
-    # === Define Environment-Specific Tuning Parameters (as before) ===
+    # === Define Environment-Specific Tuning Parameters ===
     drawdown_penalty_factor = trial.suggest_float('drawdown_penalty_factor', 0.0001, 1.0, log=True)
     tuned_stop_loss = trial.suggest_float('stop_loss', 0.80, 0.95, step=0.01)
     tuned_take_profit = trial.suggest_float('take_profit', 1.05, 1.20, step=0.01)
@@ -1269,6 +1327,7 @@ def objective(
 
         env_instance = SingleStockTradingEnv(
             df=df_train,
+            ticker=ticker,
             initial_balance=initial_balance,
             stop_loss=tuned_stop_loss,
             take_profit=tuned_take_profit,
@@ -1290,11 +1349,11 @@ def objective(
                 'momentum_threshold_min': momentum_threshold_min,
                 'momentum_threshold_max': momentum_threshold_max
             },
-            max_episode_steps=500  # Fixed cap of 500 steps per episode
+            max_episode_steps=len(df_train)  # Fixed cap of 500 steps per episode
         )
         main_logger.info(f"[Trial {trial.number}] Environment for ticker {ticker} created (env_rank={i}).")
         env_pairs.append((ticker, env_instance))
-        # Wrap each environment instance in a lambda.
+        # Wrap each environment instance in a lambda for SubprocVecEnv.
         env_factories.append(lambda e=env_instance: e)
     
     if not env_factories:
@@ -1345,7 +1404,9 @@ def objective(
         monitor='train/reward_env',
         patience=200,
         min_delta=1e-5,
-        verbose=1
+        verbose=1,
+        trial_id=trial.number
+
     )
     callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
     
@@ -1356,7 +1417,8 @@ def objective(
     try:
         model.learn(total_timesteps=total_timesteps, callback=callback_list)
     except Exception as e:
-        main_logger.critical(f"[Trial {trial.number}] Training failed: {e}")
+        error_message = traceback.format_exc()  # Capture full traceback
+        main_logger.critical(f"[Trial {trial.number}] Training failed with exception:\n{error_message}")
         return -np.inf
     duration = time.time() - start_time
     main_logger.info(f"[Trial {trial.number}] Finished PPO training in {duration:.2f} seconds.")
@@ -1364,34 +1426,65 @@ def objective(
     # === Rollout Evaluation ===
     vec_env_train.training = False
     vec_env_train.norm_reward = False
-    num_episodes_to_run = 2
+    num_episodes_to_run = 1  # or desired number
     all_episode_rewards = []
+
     for episode in range(num_episodes_to_run):
         main_logger.info(f"[Trial {trial.number}] Starting rollout episode {episode + 1}.")
         obs = vec_env_train.reset()
+        
+        # Log initial current_step values for each ticker:
+        for idx, (ticker, env_instance) in enumerate(env_pairs):
+            cs = env_instance.current_step
+            total_steps = len(env_instance.df)
+            main_logger.info(f"[Trial {trial.number}] Rollout episode {episode + 1} start for ticker {ticker}: current_step = {cs} / {total_steps}")
+
         done = [False] * vec_env_train.num_envs
         ep_rewards = np.zeros(vec_env_train.num_envs, dtype=np.float64)
         episode_steps = 0
-        while not all(done):
+        
+        max_rollout_steps = 1500  # or a fixed number if you prefer, e.g., 500
+        while not all(done) and episode_steps < max_rollout_steps:
             action, _ = model.predict(obs, deterministic=True)
             obs, rewards, done, infos = vec_env_train.step(action)
+
+            # Log the done flags and infos for this step:
+            main_logger.debug(f"[Trial {trial.number}] Step {episode_steps}: done = {done}")
+            main_logger.debug(f"[Trial {trial.number}] Step {episode_steps}: infos = {infos}")
+
             ep_rewards += rewards
             episode_steps += 1
         main_logger.info(f"[Trial {trial.number}] Episode {episode + 1} complete: {episode_steps} steps, rewards: {ep_rewards}")
+        
+        # Log final current_step values for each ticker:
+        for idx, (ticker, env_instance) in enumerate(env_pairs):
+            cs = env_instance.current_step
+            total_steps = len(env_instance.df)
+            main_logger.info(f"[Trial {trial.number}] Rollout episode {episode + 1} end for ticker {ticker}: current_step = {cs} / {total_steps}")
+        
         all_episode_rewards.extend(ep_rewards)
+
     if len(all_episode_rewards) == 0:
         rollout_cumulative_reward = -math.inf
     else:
         rollout_cumulative_reward = float(np.mean(all_episode_rewards))
-    main_logger.info(f"[Trial {trial.number}] Rollout cumulative reward: {rollout_cumulative_reward}")
+    main_logger.info(f"[Trial {trial.number}] Rollout cumulative reward: {rollout_cumulative_reward}")    
     
     # === Final Environment Evaluation via env_method() ===
-    # Retrieve the final metrics (including the full history) from each sub-environment.
-    final_metrics_all = vec_env_train.env_method("get_final_metrics")
-    
+    # Retrieve the final metrics from each sub-environment. Each metrics dict includes the full history.
+    final_metrics_all = vec_env_train.env_method("get_final_metrics")    
+    main_logger.info(f"[Trial {trial.number}] Retrieved final_metrics_all: {final_metrics_all}")    
+
+    # Log the episode length for each environment (ticker)
+    for idx, (ticker, env_instance) in enumerate(env_pairs):
+        metrics = final_metrics_all[idx] if idx < len(final_metrics_all) else {}
+        history = metrics.get("history", [])
+        episode_length = len(history)
+        main_logger.info(f"[Trial {trial.number}] For ticker {ticker}: Episode length = {episode_length} steps (Data length: {len(env_instance.df)})")
+
+    # Now proceed with writing CSV files from the metrics...
     for idx, (ticker, _) in enumerate(env_pairs):
         metrics = final_metrics_all[idx] if idx < len(final_metrics_all) else {}
-        # Use the appended history from self.history as-is.
         summary = {
             "cumulative_reward": metrics.get("cumulative_reward", 0.0),
             "net_worth": metrics.get("net_worth", initial_balance),
@@ -1400,24 +1493,52 @@ def objective(
             "transaction_count": metrics.get("transaction_count", 0),
             "peak": metrics.get("peak", initial_balance)
         }
+        # Raw history as recorded in self.history.
         history = metrics.get("history", [])
-        # Write the summary to a CSV file.
+        
+        # --- Create a normalized version of the history ---
+        norm_history = []
+        for record in history:
+            # For reward: use the raw reward (key "raw_reward", or fallback to "Reward").
+            raw_r = record.get("raw_reward", record.get("Reward", 0.0))
+            norm_r = vec_env_train.normalize_reward(np.array([raw_r]))[0]
+            # For observation: use the raw observation stored in "Observation".
+            raw_obs = record.get("Observation", None)
+            if raw_obs is not None:
+                norm_obs = vec_env_train.normalize_obs(np.array([raw_obs]))[0]
+            else:
+                norm_obs = None
+            new_record = record.copy()
+            new_record["Normalized_Reward"] = norm_r
+            new_record["Normalized_Observation"] = norm_obs
+            norm_history.append(new_record)
+        
+        # Write summary CSV.
         summary_file = RESULTS_DIR / f"trial_{trial.number}_{ticker}_final_summary.csv"
         try:
             pd.DataFrame([summary]).to_csv(summary_file, index=False)
             main_logger.info(f"[Trial {trial.number}] Ticker {ticker}: Final summary saved to {summary_file}")
         except Exception as e:
             main_logger.warning(f"[Trial {trial.number}] Ticker {ticker}: Failed to save final summary: {e}")
-        # Write the full history (all the appended records) to a separate CSV file.
+        
+        # Write raw history CSV.
         history_file = RESULTS_DIR / f"trial_{trial.number}_{ticker}_full_history.csv"
         try:
             pd.DataFrame(history).to_csv(history_file, index=False)
-            main_logger.info(f"[Trial {trial.number}] Ticker {ticker}: Full history saved to {history_file}")
+            main_logger.info(f"[Trial {trial.number}] Ticker {ticker}: Full raw history saved to {history_file}")
         except Exception as e:
-            main_logger.warning(f"[Trial {trial.number}] Ticker {ticker}: Failed to save full history: {e}")
-    
-    # Return the rollout cumulative reward as the objective metric.
+            main_logger.warning(f"[Trial {trial.number}] Ticker {ticker}: Failed to save raw history: {e}")
+        
+        # Write normalized history CSV.
+        norm_history_file = RESULTS_DIR / f"trial_{trial.number}_{ticker}_full_history_normalized.csv"
+        try:
+            pd.DataFrame(norm_history).to_csv(norm_history_file, index=False)
+            main_logger.info(f"[Trial {trial.number}] Ticker {ticker}: Normalized history saved to {norm_history_file}")
+        except Exception as e:
+            main_logger.warning(f"[Trial {trial.number}] Ticker {ticker}: Failed to save normalized history: {e}")
+
     return rollout_cumulative_reward
+
 
 if __name__ == "__main__":
     main_logger.info("Starting pipeline for multi‐ticker training (ITC, APOLLOTYRE) and single‐ticker testing (GRINDWELL).")
@@ -1522,64 +1643,12 @@ if __name__ == "__main__":
 
         return df
 
-    # ----------------------------------------------------------------
-    # 2. Create multiple training envs (ITC, APOLLOTYRE) via SubprocVecEnv
-    # ----------------------------------------------------------------
-    train_tickers = ["ITC.NS", "APOLLOTYRE.NS"]
-    train_envs = []
-    for i, ticker in enumerate(train_tickers):
-        df_full = get_data(ticker, "2018-01-01", "2025-02-05")
-        if df_full.empty:
-            main_logger.warning(f"No data for {ticker}, skipping.")
-            continue
-
-        # 80% train, 20% hold-out (not used here, but you could do so if needed)
-        split_idx = int(len(df_full) * 0.8)
-        df_train = df_full.iloc[:split_idx].reset_index(drop=True)
-        if df_train.empty:
-            main_logger.warning(f"Training portion is empty for {ticker}, skipping.")
-            continue
-
-        env_instance = SingleStockTradingEnv(
-            df=df_train,
-            initial_balance=100000,
-            stop_loss=0.90,
-            take_profit=1.10,
-            max_position_size=0.5,
-            max_drawdown=0.20,
-            annual_trading_days=252,
-            transaction_cost=0.001,
-            env_rank=i,
-            some_factor=0.01,
-            hold_threshold=0.1,
-            reward_weights={
-                'reward_scale': 1.0,
-                'profit_weight': 1.5,
-                'sharpe_bonus_weight': 0.05,
-                'transaction_penalty_weight': 1e-3,
-                'holding_bonus_weight': 0.001,
-                'transaction_penalty_scale': 1.0,
-                'volatility_threshold': 1.0,
-                'momentum_threshold_min': 30,
-                'momentum_threshold_max': 70
-            },
-			max_episode_steps=500
-        )
-        # For SubprocVecEnv, pass a function returning the env
-        train_envs.append(lambda e=env_instance: e)
-
-    if not train_envs:
-        main_logger.critical("No training environments created. Exiting.")
-        exit()
-
-    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
-    vec_env_train = SubprocVecEnv(train_envs)
-    vec_env_train = VecNormalize(vec_env_train, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    train_tickers = ["ITC.NS", "APOLLOTYRE.NS" , "ADVENZYMES.NS", "HCLTECH.NS"]#, "EXIDEIND.NS", "KPIL.NS"]    
 
     # ----------------------------------------------------------------
     # 3. Prepare single ticker (GRINDWELL) for final testing
     # ----------------------------------------------------------------
-    test_ticker = "GRINDWELL.NS"
+    test_ticker = "ITC.NS"
     df_test_full = get_data(test_ticker, "2018-01-01", "2025-02-05")
     if df_test_full.empty:
         main_logger.error(f"No data for test ticker {test_ticker}. Exiting.")
@@ -1619,7 +1688,7 @@ if __name__ == "__main__":
     study.optimize(
         lambda trial: objective(
             trial,
-            train_tickers=["ITC.NS", "APOLLOTYRE.NS"],
+            train_tickers=train_tickers,
             initial_balance=100000,
             stop_loss=0.90,
             take_profit=1.10,
@@ -1654,6 +1723,7 @@ if __name__ == "__main__":
 
         env_instance = SingleStockTradingEnv(
             df=df_train,
+            ticker=ticker,
             initial_balance=INITIAL_BALANCE,
             stop_loss=best_params.get('stop_loss', STOP_LOSS),
             take_profit=best_params.get('take_profit', TAKE_PROFIT),
@@ -1675,7 +1745,7 @@ if __name__ == "__main__":
                 'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
                 'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
             },
-			max_episode_steps=500
+			max_episode_steps=len(df_train)
         )
         final_envs.append(lambda e=env_instance: e)
 
@@ -1721,6 +1791,7 @@ if __name__ == "__main__":
 
     env_test = SingleStockTradingEnv(
         df=test_df,
+        ticker=test_ticker,
         initial_balance=INITIAL_BALANCE,
         stop_loss=best_params.get('stop_loss', STOP_LOSS),
         take_profit=best_params.get('take_profit', TAKE_PROFIT),
@@ -1742,7 +1813,7 @@ if __name__ == "__main__":
             'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
             'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
         },
-		max_episode_steps=500
+		max_episode_steps=len(test_df)
     )
 
     # Create a SubprocVecEnv for normalization and load saved stats
@@ -1751,33 +1822,44 @@ if __name__ == "__main__":
     test_vec = VecNormalize.load("vec_normalize.pkl", test_vec)
     test_vec.training = False
     test_vec.norm_reward = False
-
-    # Load the final PPO model
+    
+    # Load the final PPO model using the test vectorized environment (which has the normalization stats)
     loaded_model = PPO.load("ppo_final_model.zip", env=test_vec)
 
-    obs, _ = env_test.reset()
-    done = False
+    # Reset the vectorized test environment
+    obs = test_vec.reset()  # note: test_vec.reset() returns the normalized observation(s)
+    done = [False] * test_vec.num_envs
     steps_taken = 0
     max_test_steps = len(test_df)
     rl_test_history = []  # List to collect history entries
 
-    while not done and steps_taken < max_test_steps:
+    # Prediction loop remains the same:
+    while not all(done) and steps_taken < max_test_steps:
         action, _ = loaded_model.predict(obs, deterministic=True)
-        # Note: Make sure your env_test.step() returns 5 values:
-        # (observation, reward, terminated, truncated, info)
-        obs, reward, done, truncated, info = env_test.step(action)
+        obs, rewards, done, infos = test_vec.step(action)
         steps_taken += 1
         if steps_taken % 100 == 0:
-            training_logger.info(f"[Test Ticker] Step {steps_taken}: Action = {action}, Reward = {reward}")
-        # Append the latest history entry (assumes env_test.history is updated each step)
-        if hasattr(env_test, 'history') and len(env_test.history) >= steps_taken:
-            rl_test_history.append(env_test.history[-1])
+            training_logger.info(f"[Test Ticker] Step {steps_taken}: Action = {action}, Rewards = {rewards}")
 
-    if env_test.history:
-        final_net_worth = env_test.history[-1]["Net Worth"]
-        main_logger.info(f"Test complete on {test_ticker}. Final net worth: ${final_net_worth:.2f}")
+    # After the loop, retrieve the history from the vectorized environment.
+    # --- After finishing the prediction loop, retrieve final metrics ---
+    final_metrics_list = test_vec.env_method("get_final_metrics")
+    if final_metrics_list and len(final_metrics_list) > 0:
+        # Since we are using a single test environment, take the first element.
+        final_metrics = final_metrics_list[0]
+        rl_test_history = final_metrics.get("history", [])
+        if rl_test_history:
+            final_net_worth = final_metrics.get("net_worth", None)
+            if final_net_worth is not None:
+                main_logger.info(f"Test complete on {test_ticker}. Final net worth: ${final_net_worth:.2f}")
+            else:
+                main_logger.warning("Final net worth is not available in the metrics.")
+        else:
+            main_logger.warning("No test history recorded in final metrics.")
+            rl_test_history = []
     else:
-        main_logger.warning("No test history recorded.")
+        main_logger.warning("No final metrics retrieved from the test environment.")
+        rl_test_history = []
 
     # Convert history to a DataFrame and save to CSV
     rl_test_df = pd.DataFrame(rl_test_history)
@@ -1788,5 +1870,3 @@ if __name__ == "__main__":
     else:
         pd.DataFrame().to_csv(test_history_file, index=False)
         main_logger.warning(f"Testing environment history was empty. Saved empty CSV at {test_history_file}")
-
-
