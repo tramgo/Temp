@@ -7,9 +7,10 @@ from ta import trend, momentum, volatility, volume
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.backends.backend_pdf import PdfPages
+import yfinance as yf
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, SubprocVecEnv
 from stable_baselines3.common.vec_env import VecNormalize
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
@@ -120,7 +121,8 @@ class SingleStockTradingEnv(gym.Env):
         reward_weights: Optional[dict] = None,
         trailing_drawdown_trigger: float = 0.20,
         trailing_drawdown_grace: int = 3,
-        forced_liquidation_penalty: float = -5.0
+        forced_liquidation_penalty: float = -5.0,
+        max_episode_steps: Optional[int] = None  # New parameter to cap episode length
     ):
         super(SingleStockTradingEnv, self).__init__()
         self.env_rank = env_rank
@@ -139,6 +141,12 @@ class SingleStockTradingEnv(gym.Env):
         self.trailing_drawdown_grace = trailing_drawdown_grace
         self.forced_liquidation_penalty = forced_liquidation_penalty
 
+        # Set maximum steps per episode; if not provided, default to 1000 or the number of data rows if fewer.
+        if max_episode_steps is None:
+            self.max_episode_steps = min(1000, len(self.df))
+        else:
+            self.max_episode_steps = max_episode_steps
+
         import collections
         self.reward_history = collections.deque(maxlen=500)
 
@@ -146,8 +154,7 @@ class SingleStockTradingEnv(gym.Env):
         self.num_features = len(FEATURES_TO_SCALE)
         self.market_phase = ['Bull', 'Bear', 'Sideways']
 
-        # shape = (#technical features) + 3 for (balance ratio, net_worth ratio, position ratio)
-        #        + len(market_phase) + 2 for drawdown stats
+        # Observation: technical features + (balance ratio, net worth ratio, position ratio) + market phase flags + drawdown stats.
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -169,13 +176,12 @@ class SingleStockTradingEnv(gym.Env):
         training_logger.debug(f"[Env {self.env_rank}] Seed set to {seed}")
 
     def _next_observation(self) -> np.ndarray:
+        # Ensure the current_step index is within bounds
         if self.current_step >= len(self.df):
             self.current_step = len(self.df) - 1
         current_data = self.df.iloc[self.current_step]
 
-        # ----------------------------------------------------------------------
-        # Use the raw columns (Close, RSI, ADX, etc.) instead of *_unscaled
-        # ----------------------------------------------------------------------
+        # Use the raw columns (Close, RSI, ADX, etc.) as defined in FEATURES_TO_SCALE
         features = current_data[FEATURES_TO_SCALE].values
 
         obs_list = list(features)
@@ -183,7 +189,7 @@ class SingleStockTradingEnv(gym.Env):
         obs_list.append(self.net_worth / self.initial_balance)
         obs_list.append(self.position / self.initial_balance)
 
-        # Market phase logic
+        # Market phase logic based on ADX and SMAs
         try:
             adx_val = float(current_data['ADX'])
         except KeyError:
@@ -203,6 +209,7 @@ class SingleStockTradingEnv(gym.Env):
         for p in self.market_phase:
             obs_list.append(1.0 if phase == p else 0.0)
 
+        # Drawdown statistics
         if self.peak > 0:
             current_drawdown_fraction = (self.peak - self.net_worth) / self.peak
         else:
@@ -236,9 +243,29 @@ class SingleStockTradingEnv(gym.Env):
         self.consecutive_drawdown_steps = 0
         self.reward_history.clear()
         return self._next_observation(), {}
+    
+    def get_final_metrics(self):
+        return getattr(self, "last_episode_metrics", {
+            "cumulative_reward": 0.0,
+            "net_worth": self.initial_balance,
+            "balance": self.initial_balance,
+            "position": 0,
+            "transaction_count": 0,
+            "peak": self.initial_balance,
+            "history": []
+        })
+
 
     def step(self, action: np.ndarray):
+        print(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
+        training_logger.debug(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
         training_logger.debug(f"[Env {self.env_rank}] step() called at current_step={self.current_step} with action={action}")
+
+        training_logger.debug(
+            f"[Env {self.env_rank} step()] action={action} "
+            f"type={type(action)} "
+            f"shape={(action.shape if hasattr(action, 'shape') else None)}"
+        )
         try:
             action_value = float(action[0])
             assert self.action_space.contains(action), f"[Env {self.env_rank}] Invalid action: {action}"
@@ -247,6 +274,8 @@ class SingleStockTradingEnv(gym.Env):
             return self._next_observation(), -1000.0, True, False, {}
 
         invalid_action_penalty = -0.01
+
+        # If we've exhausted the dataset, force termination.
         if self.current_step >= len(self.df):
             terminated = True
             truncated = False
@@ -275,6 +304,7 @@ class SingleStockTradingEnv(gym.Env):
         trade_cost = 0.0
         invalid_act_penalty = 0.0
 
+        # --- Buy logic ---
         if action_value > 0:
             investment_amount = self.balance * action_value * self.max_position_size
             shares_to_buy = math.floor(investment_amount / current_price)
@@ -292,6 +322,7 @@ class SingleStockTradingEnv(gym.Env):
             else:
                 invalid_act_penalty = invalid_action_penalty
 
+        # --- Sell logic ---
         elif action_value < 0:
             proportion_to_sell = abs(action_value) * self.max_position_size
             shares_to_sell = math.floor(self.position * proportion_to_sell)
@@ -306,8 +337,9 @@ class SingleStockTradingEnv(gym.Env):
                 trade_cost = shares_traded * current_price * self.transaction_cost
             else:
                 invalid_act_penalty = invalid_action_penalty
+        # --- Hold action ---
         else:
-            pass  # Holding
+            pass
 
         net_worth = float(self.balance + self.position * current_price)
         net_worth_change = net_worth - self.prev_net_worth
@@ -365,7 +397,7 @@ class SingleStockTradingEnv(gym.Env):
         net_worth = float(self.balance + self.position * current_price)
         self.net_worth = net_worth
 
-        hold_factor = max(0, 1 - abs(action_value)/0.1)
+        hold_factor = max(0, 1 - abs(action_value) / 0.1)
         raw_vol = current_data['Volatility']
         vol_thresh = self.reward_weights.get('volatility_threshold', 1.0)
         volatility_factor = 1.0 - np.clip(raw_vol / vol_thresh, 0.0, 1.0)
@@ -408,7 +440,9 @@ class SingleStockTradingEnv(gym.Env):
             scaled_reward = math.tanh(float(raw_reward) / 10)
 
         scaled_reward *= self.reward_weights.get('reward_scale', 1.0)
-        normalized_reward = scaled_reward
+        normalized_reward = float(raw_reward)
+
+        #normalized_reward = reward
 
         self.history.append({
             'Date': current_date,
@@ -419,20 +453,38 @@ class SingleStockTradingEnv(gym.Env):
             'Net Worth': net_worth,
             'Balance': self.balance,
             'Position': self.position,
-            'Reward': normalized_reward,
-            'raw_reward': raw_reward,
+            'Reward': normalized_reward,   
+            'raw_reward': raw_reward,         
             'Trade_Cost': trade_cost
         })
 
-        terminated = False
-        truncated = False
+        # --- Revised Termination Condition ---
+        # Ensure a minimum number of steps before termination.
         MIN_STEPS = 10
         if self.current_step >= MIN_STEPS:
             if net_worth <= 0:
                 terminated = True
                 normalized_reward -= 10.0
-            elif self.current_step >= len(self.df) - 1:
+            # Terminate if we have reached the end of the data or exceeded max_episode_steps.
+            elif self.current_step >= self.max_episode_steps or self.current_step >= len(self.df) - 1:
                 terminated = True
+            else:
+                terminated = False
+        else:
+            terminated = False
+        truncated = False
+        # --------------------------------------
+        # When the episode terminates, capture final metrics.
+        if terminated:
+            self.last_episode_metrics = {
+                "cumulative_reward": sum(entry.get('Reward', 0.0) for entry in self.history),
+                "net_worth": self.net_worth,
+                "balance": self.balance,
+                "position": self.position,
+                "transaction_count": self.transaction_count,
+                "peak": self.peak,
+                "history": self.history.copy()  # copy the full list of step records
+            }
 
         if not terminated:
             self.prev_net_worth = net_worth
@@ -1079,9 +1131,10 @@ class CustomTensorboardCallback(BaseCallback):
         self.start_time = time.time()
 
     def _on_step(self) -> bool:
-        env = self.training_env.envs[0]
-        if hasattr(env, 'history') and env.history:
-            last_step = env.history[-1]
+        # Use get_attr() to fetch 'history' from the first sub-environment
+        histories = self.training_env.get_attr('history', indices=0)
+        if histories and histories[0]:
+            last_step = histories[0][-1]
             recent_reward = last_step.get('Reward', 0.0)
             self.rewards_buffer.append(recent_reward)
             if len(self.rewards_buffer) > self.window_size:
@@ -1091,7 +1144,6 @@ class CustomTensorboardCallback(BaseCallback):
             self.logger.record("train/net_worth_env", last_step.get('Net Worth', 0.0))
             self.logger.record("train/balance_env", last_step.get('Balance', 0.0))
             self.logger.record("train/position_env", last_step.get('Position', 0.0))
-
         if self.start_time:
             elapsed_time = time.time() - self.start_time
             formatted_time = time.strftime("%H:%M:%S", time.gmtime(elapsed_time))
@@ -1100,14 +1152,30 @@ class CustomTensorboardCallback(BaseCallback):
         return True
 
     def _on_training_end(self) -> None:
-        env = self.training_env.envs[0]
-        if hasattr(env, 'history') and env.history:
-            self.logger.record("train/final_net_worth", env.history[-1].get('Net Worth', 0.0))
-            self.logger.record("train/final_reward", sum(h['Reward'] for h in env.history))
-            self.logger.record("train/final_balance", env.history[-1].get('Balance', 0.0))
-            self.logger.record("train/final_position", env.history[-1].get('Position', 0.0))
-            rewards_slice = [step.get('Reward', 0.0) for step in env.history[-self.window_size:]]
-            final_rolling_avg = np.mean(rewards_slice) if rewards_slice else 0.0
+        histories = self.training_env.get_attr('history', indices=0)
+        if histories and histories[0]:
+            last_step = histories[0][-1]
+            self.logger.record("train/final_net_worth", last_step.get('Net Worth', 0.0))
+            
+            # Safely sum only numeric rewards:
+            valid_rewards = []
+            for entry in histories[0]:
+                r = entry.get('Reward', 0.0)
+                if isinstance(r, (int, float)):
+                    valid_rewards.append(r)
+                else:
+                    # If the reward is not numeric, log a warning and use 0.0.
+                    self.logger.record("train/non_numeric_reward_detected", str(r))
+                    valid_rewards.append(0.0)
+            total_reward = sum(valid_rewards)
+            self.logger.record("train/final_reward", total_reward)
+            
+            self.logger.record("train/final_balance", last_step.get('Balance', 0.0))
+            self.logger.record("train/final_position", last_step.get('Position', 0.0))
+            if valid_rewards:
+                final_rolling_avg = np.mean(valid_rewards[-self.window_size:])
+            else:
+                final_rolling_avg = 0.0
             self.logger.record("train/final_rolling_avg_reward", final_rolling_avg)
         else:
             self.logger.record("train/final_net_worth", 0.0)
@@ -1115,6 +1183,8 @@ class CustomTensorboardCallback(BaseCallback):
             self.logger.record("train/final_balance", 0.0)
             self.logger.record("train/final_position", 0.0)
             self.logger.record("train/final_rolling_avg_reward", 0.0)
+
+
 
 def calculate_max_drawdown(net_worth_series: pd.Series) -> float:
     rolling_max = net_worth_series.cummax()
@@ -1135,15 +1205,24 @@ def generate_unique_study_name(base_name='rl_trading_agent_study'):
 
 def objective(
     trial,
-    df,
-    initial_balance,
-    stop_loss,
-    take_profit,
-    max_position_size,
-    max_drawdown,
-    annual_trading_days,
-    transaction_cost
+    train_tickers: list,
+    initial_balance: float,
+    stop_loss: float,
+    take_profit: float,
+    max_position_size: float,
+    max_drawdown: float,
+    annual_trading_days: int,
+    transaction_cost: float
 ):
+    import math
+    import numpy as np
+    import torch
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+    from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
+    import pandas as pd
+
+    # === Define PPO Hyperparameters (as before) ===
     learning_rate = trial.suggest_loguniform('learning_rate', 1e-6, 1e-3)
     n_steps = trial.suggest_categorical('n_steps', [128, 256, 512])
     batch_size = trial.suggest_categorical('batch_size', [32, 64])
@@ -1153,7 +1232,9 @@ def objective(
     ent_coef = trial.suggest_loguniform('ent_coef', 1e-4, 1e-1)
     vf_coef = trial.suggest_uniform('vf_coef', 0.1, 0.5)
     max_grad_norm = trial.suggest_uniform('max_grad_norm', 0.5, 1.0)
-    net_arch = trial.suggest_categorical('net_arch', ['128_128', '256_256', '128_256_128'])
+    net_arch_str = trial.suggest_categorical('net_arch', ['128_128', '256_256', '128_256_128'])
+    
+    # === Define Environment-Specific Tuning Parameters (as before) ===
     drawdown_penalty_factor = trial.suggest_float('drawdown_penalty_factor', 0.0001, 1.0, log=True)
     tuned_stop_loss = trial.suggest_float('stop_loss', 0.80, 0.95, step=0.01)
     tuned_take_profit = trial.suggest_float('take_profit', 1.05, 1.20, step=0.01)
@@ -1170,45 +1251,68 @@ def objective(
     momentum_threshold_min = trial.suggest_float("momentum_threshold_min", 30, 45)
     momentum_threshold_max = trial.suggest_float("momentum_threshold_max", 55, 70)
     hold_threshold = trial.suggest_float("hold_threshold", 0.0, 0.1, step=0.01)
+    
+    # === Build Environment List and Store Ticker-Env Pairs ===
+    env_factories = []
+    env_pairs = []  # list of (ticker, env_instance)
+    for i, ticker in enumerate(train_tickers):
+        main_logger.info(f"[Trial {trial.number}] Creating training environment for ticker {ticker}")
+        df_full = get_data(ticker, "2018-01-01", "2025-02-05")
+        if df_full.empty:
+            main_logger.warning(f"[Trial {trial.number}] No data for ticker {ticker}. Skipping.")
+            continue
+        split_idx = int(len(df_full) * 0.8)
+        df_train = df_full.iloc[:split_idx].copy()
+        if df_train.empty:
+            main_logger.warning(f"[Trial {trial.number}] Training data empty for ticker {ticker}. Skipping.")
+            continue
 
-    env_train = SingleStockTradingEnv(
-        df=df,
-        initial_balance=initial_balance,
-        stop_loss=tuned_stop_loss,
-        take_profit=tuned_take_profit,
-        max_position_size=tuned_max_position_size,
-        max_drawdown=tuned_max_drawdown,
-        annual_trading_days=annual_trading_days,
-        transaction_cost=tuned_transaction_cost,
-        env_rank=trial.number + 1,
-        some_factor=drawdown_penalty_factor,
-        hold_threshold=hold_threshold,
-        reward_weights={
-            'reward_scale': tuned_reward_scale,
-            'profit_weight': profit_weight,
-            'sharpe_bonus_weight': sharpe_bonus_weight,
-            'transaction_penalty_weight': transaction_penalty_weight,
-            'holding_bonus_weight': holding_bonus_weight,
-            'transaction_penalty_scale': transaction_penalty_scale,
-            'volatility_threshold': volatility_threshold,
-            'momentum_threshold_min': momentum_threshold_min,
-            'momentum_threshold_max': momentum_threshold_max
-        }
-    )
-    env_train.seed(RANDOM_SEED + trial.number + 1)
-    vec_env_train = DummyVecEnv([lambda: env_train])
+        env_instance = SingleStockTradingEnv(
+            df=df_train,
+            initial_balance=initial_balance,
+            stop_loss=tuned_stop_loss,
+            take_profit=tuned_take_profit,
+            max_position_size=tuned_max_position_size,
+            max_drawdown=tuned_max_drawdown,
+            annual_trading_days=annual_trading_days,
+            transaction_cost=tuned_transaction_cost,
+            env_rank=i,
+            some_factor=drawdown_penalty_factor,
+            hold_threshold=hold_threshold,
+            reward_weights={
+                'reward_scale': tuned_reward_scale,
+                'profit_weight': profit_weight,
+                'sharpe_bonus_weight': sharpe_bonus_weight,
+                'transaction_penalty_weight': transaction_penalty_weight,
+                'holding_bonus_weight': holding_bonus_weight,
+                'transaction_penalty_scale': transaction_penalty_scale,
+                'volatility_threshold': volatility_threshold,
+                'momentum_threshold_min': momentum_threshold_min,
+                'momentum_threshold_max': momentum_threshold_max
+            },
+            max_episode_steps=500  # Fixed cap of 500 steps per episode
+        )
+        main_logger.info(f"[Trial {trial.number}] Environment for ticker {ticker} created (env_rank={i}).")
+        env_pairs.append((ticker, env_instance))
+        # Wrap each environment instance in a lambda.
+        env_factories.append(lambda e=env_instance: e)
+    
+    if not env_factories:
+        main_logger.critical(f"[Trial {trial.number}] No training environments were created. Exiting trial.")
+        return -math.inf
 
-    # Wrap with VecNormalize for both obs and reward scaling:
+    vec_env_train = SubprocVecEnv(env_factories)
     vec_env_train = VecNormalize(vec_env_train, norm_obs=True, norm_reward=True, clip_obs=10.0)
-
+    
+    # === Set Up PPO Model with Hyperparameters ===
     policy_kwargs = dict(
         activation_fn=torch.nn.ReLU,
-        net_arch=[int(x) for x in net_arch.split('_')]
+        net_arch=[int(x) for x in net_arch_str.split('_')]
     )
-
+    
     trial_log_dir = TB_LOG_DIR / f"trial_{trial.number}"
     trial_log_dir.mkdir(parents=True, exist_ok=True)
-
+    
     model = PPO(
         'MlpPolicy',
         vec_env_train,
@@ -1227,55 +1331,93 @@ def objective(
         tensorboard_log=str(trial_log_dir),
         device='cpu'
     )
-
+    
+    # === Set Up Callbacks ===
     trial_checkpoint_dir = RESULTS_DIR / f"checkpoints_trial_{trial.number}"
     trial_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_callback = CheckpointCallback(
-        save_freq=50000,
+        save_freq=500,
         save_path=str(trial_checkpoint_dir),
         name_prefix="ppo_model"
     )
-
     custom_callback = CustomTensorboardCallback()
     early_stopping_callback = EarlyStoppingCallback(
         monitor='train/reward_env',
-        patience=3000,
+        patience=200,
         min_delta=1e-5,
         verbose=1
     )
     callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
-
+    
+    # === PPO Training ===
+    total_timesteps = 5000
     start_time = time.time()
+    main_logger.info(f"[Trial {trial.number}] Starting PPO training with {total_timesteps} timesteps.")
     try:
-        model.learn(total_timesteps=100000, callback=callback_list)
+        model.learn(total_timesteps=total_timesteps, callback=callback_list)
     except Exception as e:
         main_logger.critical(f"[Trial {trial.number}] Training failed: {e}")
         return -np.inf
-
     duration = time.time() - start_time
-    env_train_history = env_train.history
-    cumulative_reward = sum([entry['Reward'] for entry in env_train_history]) if env_train_history else 0.0
-
-    main_logger.critical(f"[Trial {trial.number}] Cumulative Reward: {cumulative_reward:.4f}")
-    main_logger.critical(f"[Trial {trial.number}] Final Net Worth: ${env_train.net_worth:.2f}")
-    main_logger.critical(f"[Trial {trial.number}] Final Balance: ${env_train.balance:.2f}")
-    main_logger.critical(f"[Trial {trial.number}] Final Position: {env_train.position} shares")
-    main_logger.critical(f"[Trial {trial.number}] Total Transactions: {env_train.transaction_count}")
-    main_logger.critical(f"[Trial {trial.number}] Final Peak Net Worth: ${env_train.peak:.2f}")
-
-    final_drawdown = (env_train.peak - env_train.net_worth) / env_train.peak if env_train.peak > 0 else 0.0
-    main_logger.critical(f"[Trial {trial.number}] Final Drawdown: {final_drawdown*100:.2f}%")
-
-    trial_log_file = RESULTS_DIR / f"trial_{trial.number}_history.csv"
-    if env_train_history:
-        pd.DataFrame(env_train_history).to_csv(trial_log_file, index=False)
-        main_logger.info(f"[Trial {trial.number}] Environment history saved to {trial_log_file}")
+    main_logger.info(f"[Trial {trial.number}] Finished PPO training in {duration:.2f} seconds.")
+    
+    # === Rollout Evaluation ===
+    vec_env_train.training = False
+    vec_env_train.norm_reward = False
+    num_episodes_to_run = 2
+    all_episode_rewards = []
+    for episode in range(num_episodes_to_run):
+        main_logger.info(f"[Trial {trial.number}] Starting rollout episode {episode + 1}.")
+        obs = vec_env_train.reset()
+        done = [False] * vec_env_train.num_envs
+        ep_rewards = np.zeros(vec_env_train.num_envs, dtype=np.float64)
+        episode_steps = 0
+        while not all(done):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, rewards, done, infos = vec_env_train.step(action)
+            ep_rewards += rewards
+            episode_steps += 1
+        main_logger.info(f"[Trial {trial.number}] Episode {episode + 1} complete: {episode_steps} steps, rewards: {ep_rewards}")
+        all_episode_rewards.extend(ep_rewards)
+    if len(all_episode_rewards) == 0:
+        rollout_cumulative_reward = -math.inf
     else:
-        pd.DataFrame().to_csv(trial_log_file, index=False)
-        main_logger.warning(f"[Trial {trial.number}] Environment history was empty.")
-
-    return cumulative_reward
-
+        rollout_cumulative_reward = float(np.mean(all_episode_rewards))
+    main_logger.info(f"[Trial {trial.number}] Rollout cumulative reward: {rollout_cumulative_reward}")
+    
+    # === Final Environment Evaluation via env_method() ===
+    # Retrieve the final metrics (including the full history) from each sub-environment.
+    final_metrics_all = vec_env_train.env_method("get_final_metrics")
+    
+    for idx, (ticker, _) in enumerate(env_pairs):
+        metrics = final_metrics_all[idx] if idx < len(final_metrics_all) else {}
+        # Use the appended history from self.history as-is.
+        summary = {
+            "cumulative_reward": metrics.get("cumulative_reward", 0.0),
+            "net_worth": metrics.get("net_worth", initial_balance),
+            "balance": metrics.get("balance", initial_balance),
+            "position": metrics.get("position", 0),
+            "transaction_count": metrics.get("transaction_count", 0),
+            "peak": metrics.get("peak", initial_balance)
+        }
+        history = metrics.get("history", [])
+        # Write the summary to a CSV file.
+        summary_file = RESULTS_DIR / f"trial_{trial.number}_{ticker}_final_summary.csv"
+        try:
+            pd.DataFrame([summary]).to_csv(summary_file, index=False)
+            main_logger.info(f"[Trial {trial.number}] Ticker {ticker}: Final summary saved to {summary_file}")
+        except Exception as e:
+            main_logger.warning(f"[Trial {trial.number}] Ticker {ticker}: Failed to save final summary: {e}")
+        # Write the full history (all the appended records) to a separate CSV file.
+        history_file = RESULTS_DIR / f"trial_{trial.number}_{ticker}_full_history.csv"
+        try:
+            pd.DataFrame(history).to_csv(history_file, index=False)
+            main_logger.info(f"[Trial {trial.number}] Ticker {ticker}: Full history saved to {history_file}")
+        except Exception as e:
+            main_logger.warning(f"[Trial {trial.number}] Ticker {ticker}: Failed to save full history: {e}")
+    
+    # Return the rollout cumulative reward as the objective metric.
+    return rollout_cumulative_reward
 
 if __name__ == "__main__":
     main_logger.info("Starting pipeline for multi‐ticker training (ITC, APOLLOTYRE) and single‐ticker testing (GRINDWELL).")
@@ -1283,53 +1425,98 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------
     # 1. Function to read CSV from 'data/' and parse indicators
     # ----------------------------------------------------------------
-    def get_data(ticker: str) -> pd.DataFrame:
-        file_path = os.path.join("data", f"{ticker}.csv")
-        if not os.path.exists(file_path):
-            main_logger.error(f"CSV file not found for ticker: {file_path}")
-            return pd.DataFrame()
-
+    def get_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        main_logger.info(f"Fetching data from yfinance for ticker {ticker} between {start_date} and {end_date}")
         try:
-            df = pd.read_csv(file_path)
+            df = yf.download(ticker, start=start_date, end=end_date)
             if df.empty:
-                main_logger.error(f"CSV is empty for ticker {ticker}")
+                main_logger.error(f"No data fetched from yfinance for ticker {ticker}")
                 return pd.DataFrame()
-        except Exception as exc:
-            main_logger.error(f"Error reading CSV for ticker {ticker}: {exc}")
+            df.reset_index(inplace=True)
+        except Exception as e:
+            main_logger.error(f"Error fetching data from yfinance for ticker {ticker}: {e}")
             return pd.DataFrame()
 
-        # Convert numeric columns to float (in case of stray strings)
-        numeric_cols = ["Open", "High", "Low", "Close", "Volume"]
-        for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df.dropna(subset=["Open", "High", "Low", "Close", "Volume"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
+        required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+        for col in required_columns:
+            if col not in df.columns:
+                main_logger.error(f"Missing required column '{col}' in fetched data for ticker {ticker}.")
+                return pd.DataFrame()
 
-        # TA-Lib indicators
-        close = df["Close"]
-        high = df["High"]
-        low = df["Low"]
-        vol = df["Volume"]
+        # ----------------------------------------------------------------
+        # Write the raw data to a CSV file specific to the ticker.
+        # ----------------------------------------------------------------
+        raw_csv_file = RESULTS_DIR / f"data_fetched_{ticker}.csv"
+        df.to_csv(raw_csv_file, index=False)
 
-        df["SMA10"] = trend.SMAIndicator(close=close, window=10).sma_indicator()
-        df["SMA50"] = trend.SMAIndicator(close=close, window=50).sma_indicator()
-        df["RSI"] = momentum.RSIIndicator(close=close, window=14).rsi()
-        df["MACD"] = trend.MACD(close=close).macd()
-        df["ADX"] = trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
-        bb = volatility.BollingerBands(close=close, window=20, window_dev=2)
-        df["BB_Upper"] = bb.bollinger_hband()
-        df["BB_Lower"] = bb.bollinger_lband()
-        df["Bollinger_Width"] = bb.bollinger_wband()
-        df["EMA20"] = trend.EMAIndicator(close=close, window=20).ema_indicator()
-        vwap_calc = volume.VolumeWeightedAveragePrice(
-            high=high, low=low, close=close, volume=vol, window=14
-        )
-        df["VWAP"] = vwap_calc.volume_weighted_average_price()
-        df["Lagged_Return"] = close.pct_change().fillna(0)
+        # Remove the extra header line (second line) if it exists.
+        with open(raw_csv_file, 'r') as f:
+            lines = f.readlines()
+        if len(lines) > 1:
+            # Keep the first line (header) and then all lines from index 2 onward (skip the second line)
+            with open(raw_csv_file, 'w') as f:
+                f.write(lines[0])
+                f.writelines(lines[2:])
+            main_logger.info(f"Processed raw CSV file for {ticker}: removed extra header line.")
+
+        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+
+        if len(df) < 200:
+            main_logger.error("Not enough data points fetched from yfinance.")
+            return pd.DataFrame()
+
+        close = df['Close'].squeeze()
+        high = df['High'].squeeze()
+        low = df['Low'].squeeze()
+        volume_col = df['Volume'].squeeze()
+
+        sma10 = trend.SMAIndicator(close=close, window=10).sma_indicator()
+        sma50 = trend.SMAIndicator(close=close, window=50).sma_indicator()
+        rsi = momentum.RSIIndicator(close=close, window=14).rsi()
+        macd = trend.MACD(close=close).macd()
+        adx = trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
+        bollinger = volatility.BollingerBands(close=close, window=20, window_dev=2)
+        bb_upper = bollinger.bollinger_hband()
+        bb_lower = bollinger.bollinger_lband()
+        bollinger_width = bollinger.bollinger_wband()
+        ema20 = trend.EMAIndicator(close=close, window=20).ema_indicator()
+        vwap = volume.VolumeWeightedAveragePrice(
+            high=high, low=low, close=close,
+            volume=volume_col, window=14
+        ).volume_weighted_average_price()
+        lagged_return = close.pct_change().fillna(0)
         atr = volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
-        df["Volatility"] = atr
 
-        df.fillna(method="ffill", inplace=True)
+        df['SMA10'] = sma10
+        df['SMA50'] = sma50
+        df['RSI'] = rsi
+        df['MACD'] = macd
+        df['ADX'] = adx
+        df['BB_Upper'] = bb_upper
+        df['BB_Lower'] = bb_lower
+        df['Bollinger_Width'] = bollinger_width
+        df['EMA20'] = ema20
+        df['VWAP'] = vwap
+        df['Lagged_Return'] = lagged_return
+        df['Volatility'] = atr
+
+        # ----------------------------------------------------------------
+        # Write the processed (with indicators) data to a CSV file specific to the ticker.
+        # ----------------------------------------------------------------
+        processed_csv_file = RESULTS_DIR / f"data_with_indicators_{ticker}.csv"
+        df.to_csv(processed_csv_file, index=False)
+
+        # Again, remove the extra header line from the processed file.
+        with open(processed_csv_file, 'r') as f:
+            lines = f.readlines()
+        if len(lines) > 1:
+            with open(processed_csv_file, 'w') as f:
+                f.write(lines[0])
+                f.writelines(lines[2:])
+            main_logger.info(f"Processed indicators CSV file for {ticker}: removed extra header line.")
+
+        df.fillna(method='ffill', inplace=True)
         df.fillna(0, inplace=True)
         df.reset_index(drop=True, inplace=True)
 
@@ -1338,10 +1525,10 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------
     # 2. Create multiple training envs (ITC, APOLLOTYRE) via SubprocVecEnv
     # ----------------------------------------------------------------
-    train_tickers = ["ITC", "APOLLOTYRE"]
+    train_tickers = ["ITC.NS", "APOLLOTYRE.NS"]
     train_envs = []
     for i, ticker in enumerate(train_tickers):
-        df_full = get_data(ticker)
+        df_full = get_data(ticker, "2018-01-01", "2025-02-05")
         if df_full.empty:
             main_logger.warning(f"No data for {ticker}, skipping.")
             continue
@@ -1375,7 +1562,8 @@ if __name__ == "__main__":
                 'volatility_threshold': 1.0,
                 'momentum_threshold_min': 30,
                 'momentum_threshold_max': 70
-            }
+            },
+			max_episode_steps=500
         )
         # For SubprocVecEnv, pass a function returning the env
         train_envs.append(lambda e=env_instance: e)
@@ -1384,17 +1572,15 @@ if __name__ == "__main__":
         main_logger.critical("No training environments created. Exiting.")
         exit()
 
-    from stable_baselines3.common.vec_env import SubprocVecEnv
+    from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
     vec_env_train = SubprocVecEnv(train_envs)
-
-    # One global scaler for all sub-envs
     vec_env_train = VecNormalize(vec_env_train, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     # ----------------------------------------------------------------
     # 3. Prepare single ticker (GRINDWELL) for final testing
     # ----------------------------------------------------------------
-    test_ticker = "GRINDWELL"
-    df_test_full = get_data(test_ticker)
+    test_ticker = "GRINDWELL.NS"
+    df_test_full = get_data(test_ticker, "2018-01-01", "2025-02-05")
     if df_test_full.empty:
         main_logger.error(f"No data for test ticker {test_ticker}. Exiting.")
         exit()
@@ -1430,21 +1616,20 @@ if __name__ == "__main__":
     n_trials = 5
     main_logger.info(f"Starting Optuna study for {n_trials} trials with multiple training envs.")
 
-    # NOTE: remove the "env_info" param from the objective call
-    #       so it matches your objective function signature
     study.optimize(
         lambda trial: objective(
             trial,
-            INITIAL_BALANCE,
-            STOP_LOSS,
-            TAKE_PROFIT,
-            MAX_POSITION_SIZE,
-            MAX_DRAWDOWN,
-            ANNUAL_TRADING_DAYS,
-            TRANSACTION_COST
+            train_tickers=["ITC.NS", "APOLLOTYRE.NS"],
+            initial_balance=100000,
+            stop_loss=0.90,
+            take_profit=1.10,
+            max_position_size=0.5,
+            max_drawdown=0.20,
+            annual_trading_days=252,
+            transaction_cost=0.001
         ),
-        n_trials=n_trials,
-        n_jobs=1
+        n_trials=5,
+        n_jobs=-1
     )
 
     if study.best_params:
@@ -1459,10 +1644,9 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------
     main_logger.info("Final training pass with best hyperparams from Optuna.")
 
-    # Recreate sub‐env for each ticker, but now using best_params
     final_envs = []
     for i, ticker in enumerate(train_tickers):
-        df_full = get_data(ticker)
+        df_full = get_data(ticker, "2018-01-01", "2025-02-05")
         if df_full.empty:
             continue
         split_idx = int(len(df_full) * 0.8)
@@ -1490,7 +1674,8 @@ if __name__ == "__main__":
                 'volatility_threshold': best_params.get('volatility_threshold', 1.0),
                 'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
                 'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
-            }
+            },
+			max_episode_steps=500
         )
         final_envs.append(lambda e=env_instance: e)
 
@@ -1522,7 +1707,7 @@ if __name__ == "__main__":
         tensorboard_log=str(TB_LOG_DIR / "final_model")
     )
 
-    total_timesteps = 300000
+    total_timesteps = 30000
     main_logger.info(f"Learning final model for {total_timesteps} timesteps with multiple tickers.")
     model_final.learn(total_timesteps=total_timesteps)
     model_final.save("ppo_final_model.zip")
@@ -1530,7 +1715,7 @@ if __name__ == "__main__":
     main_logger.info("Final multi‐ticker model + VecNormalize saved.")
 
     # ----------------------------------------------------------------
-    # 6. Test on single ticker (GRINDWELL) with saved normalization
+    # 6. Test on single ticker (GRINDWELL) with saved normalization and save test history to CSV
     # ----------------------------------------------------------------
     main_logger.info(f"Testing final model on ticker {test_ticker} with {len(test_df)} rows of data.")
 
@@ -1556,11 +1741,13 @@ if __name__ == "__main__":
             'volatility_threshold': best_params.get('volatility_threshold', 1.0),
             'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
             'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
-        }
+        },
+		max_episode_steps=500
     )
 
-    test_vec = DummyVecEnv([lambda: env_test])
-    # Load saved normalization stats
+    # Create a SubprocVecEnv for normalization and load saved stats
+    from stable_baselines3.common.vec_env import SubprocVecEnv
+    test_vec = SubprocVecEnv([lambda: env_test])
     test_vec = VecNormalize.load("vec_normalize.pkl", test_vec)
     test_vec.training = False
     test_vec.norm_reward = False
@@ -1570,13 +1757,36 @@ if __name__ == "__main__":
 
     obs, _ = env_test.reset()
     done = False
-    truncated = False
-    while not done and not truncated:
+    steps_taken = 0
+    max_test_steps = len(test_df)
+    rl_test_history = []  # List to collect history entries
+
+    while not done and steps_taken < max_test_steps:
         action, _ = loaded_model.predict(obs, deterministic=True)
+        # Note: Make sure your env_test.step() returns 5 values:
+        # (observation, reward, terminated, truncated, info)
         obs, reward, done, truncated, info = env_test.step(action)
+        steps_taken += 1
+        if steps_taken % 100 == 0:
+            training_logger.info(f"[Test Ticker] Step {steps_taken}: Action = {action}, Reward = {reward}")
+        # Append the latest history entry (assumes env_test.history is updated each step)
+        if hasattr(env_test, 'history') and len(env_test.history) >= steps_taken:
+            rl_test_history.append(env_test.history[-1])
 
     if env_test.history:
         final_net_worth = env_test.history[-1]["Net Worth"]
         main_logger.info(f"Test complete on {test_ticker}. Final net worth: ${final_net_worth:.2f}")
     else:
         main_logger.warning("No test history recorded.")
+
+    # Convert history to a DataFrame and save to CSV
+    rl_test_df = pd.DataFrame(rl_test_history)
+    test_history_file = RESULTS_DIR / "test_env_history.csv"
+    if not rl_test_df.empty:
+        rl_test_df.to_csv(test_history_file, index=False)
+        main_logger.info(f"Testing environment history saved to {test_history_file}")
+    else:
+        pd.DataFrame().to_csv(test_history_file, index=False)
+        main_logger.warning(f"Testing environment history was empty. Saved empty CSV at {test_history_file}")
+
+
