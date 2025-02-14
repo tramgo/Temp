@@ -169,7 +169,11 @@ class SingleStockTradingEnv(gym.Env):
             self.reward_weights = reward_weights
         else:
             self.reward_weights = {'reward_scale': 1.0}
-
+        
+        self.cumulative_reward = 0.0  # Running total updated each step.
+        self._force_termination = False  # Flag set by early stopping.
+        self.final_metrics = None  # Final metrics available after episode ends.
+        
         self.reset()
 
     def seed(self, seed=None):
@@ -245,6 +249,9 @@ class SingleStockTradingEnv(gym.Env):
         self.transaction_count = 0
         self.consecutive_drawdown_steps = 0
         self.reward_history.clear()
+        self.cumulative_reward = 0.0  # Running total updated each step.
+        self._force_termination = False  # Flag set by early stopping.
+        self.final_metrics = None  # Final metrics available after episode ends.
         return self._next_observation(), {}
     
     def get_final_metrics(self):
@@ -258,11 +265,41 @@ class SingleStockTradingEnv(gym.Env):
             "history": []
         })
 
+    def get_current_metrics(self):
+        """
+        Returns the up-to-date cumulative metrics (including cumulative reward) based on the current state.
+        This is used by the early stopping callback at every step.
+        """
+        return {
+            "cumulative_reward": self.cumulative_reward,
+            "net_worth": self.net_worth,
+            "balance": self.balance,
+            "position": self.position,
+            "transaction_count": self.transaction_count,
+            "peak": self.peak,
+            "history": self.history.copy()
+        }
+    
+    def set_force_termination(self, force: bool = True):
+        """
+        Sets a flag that forces the next call to step() to immediately return done=True.
+        This is used by the early stopping callback.
+        """
+        self._force_termination = force
 
     def step(self, action: np.ndarray):
-        print(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
+    
+        # If a forced termination is requested (by early stopping), end the episode immediately.
+        if self._force_termination:
+            obs = self._next_observation()
+            self.final_metrics = self.get_current_metrics()
+            self._force_termination = False  # Reset the flag.
+            return obs, 0.0, True, True, {}
+            
+        #print(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
         training_logger.debug(f"DEBUG step env_rank={self.env_rank}: returning 5 items!")
         training_logger.debug(f"[Env {self.env_rank}] step() called at current_step={self.current_step} with action={action}")
+        print(f"[Env {self.env_rank}] step() called at current_step={self.current_step} with action={action}")
 
         training_logger.debug(
             f"[Env {self.env_rank} step()] action={action} "
@@ -444,6 +481,8 @@ class SingleStockTradingEnv(gym.Env):
 
         scaled_reward *= self.reward_weights.get('reward_scale', 1.0) """
         normalized_reward = float(raw_reward)
+        
+        self.cumulative_reward += float(reward)
 
         #normalized_reward = reward      
         self.history.append({
@@ -457,7 +496,8 @@ class SingleStockTradingEnv(gym.Env):
             'Position': self.position,
             'Reward': normalized_reward,   
             #'raw_reward': raw_reward,         
-            'Trade_Cost': trade_cost            
+            'Trade_Cost': trade_cost,    
+            'cumulative_reward': self.cumulative_reward
         })
 
         # --- Revised Termination Condition ---
@@ -467,10 +507,13 @@ class SingleStockTradingEnv(gym.Env):
             if net_worth <= 0:
                 terminated = True
                 normalized_reward -= 10.0
+                self.final_metrics = self.get_current_metrics()
             elif self.current_step >= len(self.df) - 1:
                 terminated = True
+                self.final_metrics = self.get_current_metrics()
             elif self.current_step >= self.max_episode_steps:
                 terminated = True
+                self.final_metrics = self.get_current_metrics()
             else:
                 terminated = False
         else:
@@ -1098,64 +1141,53 @@ def plot_comparison(test_df: pd.DataFrame, rl_test_df: pd.DataFrame, strategy_re
     pdf.savefig()
     plt.close()
 
-
 class EarlyStoppingCallback(BaseCallback):
-    def __init__(self, monitor='train/reward_env', patience=200, min_delta=1e-5, verbose=1, trial_id=None):
-        """
-        Args:
-            monitor (str): Name of the metric to monitor.
-            patience (int): Number of steps with no improvement after which training will be stopped.
-            min_delta (float): Minimum change in the monitored metric to qualify as an improvement.
-            verbose (int): Verbosity mode.
-            trial_id: Identifier for the current trial (e.g., trial.number) for logging purposes.
-        """
+    """
+    Monitors the running cumulative reward from each sub-environment via
+    get_current_metrics(). If no improvement (by at least min_delta) is seen
+    for a number of consecutive steps (patience), it forces termination on
+    all sub-environments and stops training.
+    """
+    def __init__(self, monitor: str, patience: int, min_delta: float = 0.0, verbose: int = 0, trial_id: int = None):
         super(EarlyStoppingCallback, self).__init__(verbose)
-        self.monitor = monitor
+        self.monitor = monitor  # (for documentation; not used directly)
         self.patience = patience
         self.min_delta = min_delta
-        self.best_reward = -np.inf
-        self.wait = 0
         self.trial_id = trial_id
+        self.best_value = -np.inf
+        self.no_improve_steps = 0
 
     def _on_step(self) -> bool:
-        # Retrieve the current value of the monitored metric
-        current_reward = self.logger.name_to_value.get(self.monitor, None)
-        
-        # Retrieve additional attributes from the first sub-environment:
-        current_steps = self.training_env.get_attr("current_step", indices=0)
-        env_ids = self.training_env.get_attr("env_rank", indices=0)
-        # If you want to log the ticker, ensure your environment sets self.ticker.
-        tickers = self.training_env.get_attr("ticker", indices=0)
-        
-        if current_reward is None:
-            if self.verbose > 0:
-                training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: Metric '{self.monitor}' not found. "
-                      f"Env current_steps: {current_steps}, Env IDs: {env_ids}, Tickers: {tickers}")
-            return True
+        try:
+            # Always retrieve the current cumulative metrics from each sub-environment.
+            metrics_list = self.training_env.env_method("get_current_metrics")
+            metric_values = [m.get("cumulative_reward", -np.inf) for m in metrics_list if m is not None]
+            current_metric = float(np.mean(metric_values)) if metric_values else -np.inf
+        except Exception as e:
+            if self.verbose:
+                main_logger.critical(f"[EarlyStoppingCallback] Error retrieving current metrics: {e}")
+            current_metric = -np.inf
 
-        # Log the current state details
-        if self.verbose > 0:
-            training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: current_reward = {current_reward:.4f}, "
-                  f"best_reward = {self.best_reward:.4f}, wait = {self.wait}/{self.patience}. "
-                  f"Env current_steps: {current_steps}, Env IDs: {env_ids}, Tickers: {tickers}")
+        if self.verbose:
+            main_logger.critical(f"[EarlyStoppingCallback][Trial {self.trial_id}] Current cumulative reward = {current_metric}, "
+                  f"Best = {self.best_value}, No Improvement Steps = {self.no_improve_steps}")
 
-        if current_reward > self.best_reward + self.min_delta:
-            self.best_reward = current_reward
-            self.wait = 0
-            if self.verbose > 0:
-                training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: Reward improved to {self.best_reward:.4f}. Resetting wait counter.")
+        # If improvement exceeds min_delta, reset the counter.
+        if current_metric - self.best_value > self.min_delta:
+            self.best_value = current_metric
+            self.no_improve_steps = 0
         else:
-            self.wait += 1
-            if self.verbose > 0:
-                training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: No improvement in reward. Wait counter: {self.wait}/{self.patience}")
-            if self.wait >= self.patience:
-                if self.verbose > 0:
-                    training_logger.debug(f"[Trial {self.trial_id}] EarlyStoppingCallback: Patience exceeded. Stopping training.")
-                return False
+            self.no_improve_steps += 1
+
+        # When no improvement is seen for 'patience' steps, force termination.
+        if self.no_improve_steps >= self.patience:
+            if self.verbose:
+                main_logger.critical(f"[EarlyStoppingCallback][Trial {self.trial_id}] Patience exceeded. Forcing termination.")
+            self.training_env.env_method("set_force_termination", True)
+            return False  # Stops training in model.learn()
         return True
-
-
-
+        
+        
 class CustomTensorboardCallback(BaseCallback):
     def __init__(self, verbose=0, window_size=100):
         super(CustomTensorboardCallback, self).__init__(verbose)
@@ -1313,7 +1345,7 @@ def objective(
     # === Build Environment List and Store Ticker-Env Pairs ===
     env_factories = []
     env_pairs = []  # list of (ticker, env_instance)
-    for i, ticker in enumerate(train_tickers):
+    for i, ticker in enumerate(optuna_tickers):
         main_logger.info(f"[Trial {trial.number}] Creating training environment for ticker {ticker}")
         df_full = get_data(ticker, "2018-01-01", "2025-02-05")
         if df_full.empty:
@@ -1401,13 +1433,13 @@ def objective(
     )
     custom_callback = CustomTensorboardCallback()
     early_stopping_callback = EarlyStoppingCallback(
-        monitor='train/reward_env',
-        patience=200,
+        monitor='cumulative_reward',  # Now reflecting the running cumulative reward from get_current_metrics()
+        patience=3000,
         min_delta=1e-5,
         verbose=1,
         trial_id=trial.number
-
     )
+
     callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
     
     # === PPO Training ===
@@ -1443,7 +1475,7 @@ def objective(
         ep_rewards = np.zeros(vec_env_train.num_envs, dtype=np.float64)
         episode_steps = 0
         
-        max_rollout_steps = 1500  # or a fixed number if you prefer, e.g., 500
+        max_rollout_steps = 3000  # or a fixed number if you prefer, e.g., 500
         while not all(done) and episode_steps < max_rollout_steps:
             action, _ = model.predict(obs, deterministic=True)
             obs, rewards, done, infos = vec_env_train.step(action)
@@ -1546,104 +1578,141 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------
     # 1. Function to read CSV from 'data/' and parse indicators
     # ----------------------------------------------------------------
+    import os
+    import pandas as pd
+    import yfinance as yf
+    from pathlib import Path
+    from ta import trend, momentum, volatility, volume
+
     def get_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        Fetches data from yfinance for a given ticker and date range, then performs
+        validations and technical indicator calculations. Returns a validated
+        DataFrame or an empty DataFrame if any critical validation fails.
+        """
         main_logger.info(f"Fetching data from yfinance for ticker {ticker} between {start_date} and {end_date}")
+        
+        RESULTS_DIR = Path("./results")
+        RESULTS_DIR.mkdir(exist_ok=True, parents=True)
+
+        required_columns = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        
         try:
-            df = yf.download(ticker, start=start_date, end=end_date)
-            if df.empty:
-                main_logger.error(f"No data fetched from yfinance for ticker {ticker}")
-                return pd.DataFrame()
-            df.reset_index(inplace=True)
+            # Fetch data from yfinance
+            df = yf.download(ticker, start=start_date, end=end_date, group_by="ticker", progress=False)
         except Exception as e:
             main_logger.error(f"Error fetching data from yfinance for ticker {ticker}: {e}")
             return pd.DataFrame()
-
-        required_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required_columns:
-            if col not in df.columns:
-                main_logger.error(f"Missing required column '{col}' in fetched data for ticker {ticker}.")
-                return pd.DataFrame()
-
-        # ----------------------------------------------------------------
-        # Write the raw data to a CSV file specific to the ticker.
-        # ----------------------------------------------------------------
-        raw_csv_file = RESULTS_DIR / f"data_fetched_{ticker}.csv"
-        df.to_csv(raw_csv_file, index=False)
-
-        # Remove the extra header line (second line) if it exists.
-        with open(raw_csv_file, 'r') as f:
-            lines = f.readlines()
-        if len(lines) > 1:
-            # Keep the first line (header) and then all lines from index 2 onward (skip the second line)
-            with open(raw_csv_file, 'w') as f:
-                f.write(lines[0])
-                f.writelines(lines[2:])
-            main_logger.info(f"Processed raw CSV file for {ticker}: removed extra header line.")
-
-        numeric_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-
-        if len(df) < 200:
-            main_logger.error("Not enough data points fetched from yfinance.")
+        
+        if df.empty:
+            main_logger.error(f"No data fetched from yfinance for ticker {ticker}")
             return pd.DataFrame()
 
-        close = df['Close'].squeeze()
-        high = df['High'].squeeze()
-        low = df['Low'].squeeze()
-        volume_col = df['Volume'].squeeze()
+        # Reset index to ensure Date is a column
+        df.reset_index(inplace=True)
 
-        sma10 = trend.SMAIndicator(close=close, window=10).sma_indicator()
-        sma50 = trend.SMAIndicator(close=close, window=50).sma_indicator()
-        rsi = momentum.RSIIndicator(close=close, window=14).rsi()
-        macd = trend.MACD(close=close).macd()
-        adx = trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
-        bollinger = volatility.BollingerBands(close=close, window=20, window_dev=2)
-        bb_upper = bollinger.bollinger_hband()
-        bb_lower = bollinger.bollinger_lband()
-        bollinger_width = bollinger.bollinger_wband()
-        ema20 = trend.EMAIndicator(close=close, window=20).ema_indicator()
-        vwap = volume.VolumeWeightedAveragePrice(
-            high=high, low=low, close=close,
-            volume=volume_col, window=14
-        ).volume_weighted_average_price()
-        lagged_return = close.pct_change().fillna(0)
-        atr = volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+        # Flatten MultiIndex columns if present and remove ticker prefixes
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [col[1] if col[1] else col[0] for col in df.columns]
 
-        df['SMA10'] = sma10
-        df['SMA50'] = sma50
-        df['RSI'] = rsi
-        df['MACD'] = macd
-        df['ADX'] = adx
-        df['BB_Upper'] = bb_upper
-        df['BB_Lower'] = bb_lower
-        df['Bollinger_Width'] = bollinger_width
-        df['EMA20'] = ema20
-        df['VWAP'] = vwap
-        df['Lagged_Return'] = lagged_return
-        df['Volatility'] = atr
+        # Check for duplicates
+        if df.columns.duplicated().any():
+            duplicated_cols = df.columns[df.columns.duplicated()].unique()
+            main_logger.error(f"[get_data] Duplicate columns found for {ticker}: {list(duplicated_cols)}")
+            return pd.DataFrame()
 
-        # ----------------------------------------------------------------
-        # Write the processed (with indicators) data to a CSV file specific to the ticker.
-        # ----------------------------------------------------------------
-        processed_csv_file = RESULTS_DIR / f"data_with_indicators_{ticker}.csv"
-        df.to_csv(processed_csv_file, index=False)
+        # Confirm required columns exist
+        for col in required_columns:
+            if col not in df.columns:
+                main_logger.error(f"[get_data] Missing required column '{col}' for {ticker}.")
+                return pd.DataFrame()
 
-        # Again, remove the extra header line from the processed file.
-        with open(processed_csv_file, 'r') as f:
-            lines = f.readlines()
-        if len(lines) > 1:
-            with open(processed_csv_file, 'w') as f:
-                f.write(lines[0])
-                f.writelines(lines[2:])
-            main_logger.info(f"Processed indicators CSV file for {ticker}: removed extra header line.")
+        # Convert Date to datetime format
+        try:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df.dropna(subset=["Date"], inplace=True)
+        except Exception as e:
+            main_logger.error(f"[get_data] Error converting 'Date' column for {ticker}: {e}")
+            return pd.DataFrame()
 
-        df.fillna(method='ffill', inplace=True)
-        df.fillna(0, inplace=True)
+        # Sort by Date
+        df.sort_values("Date", inplace=True)
         df.reset_index(drop=True, inplace=True)
 
+        # Convert numeric columns
+        numeric_cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
+        
+        # Check minimum data length
+        if len(df) < 200:
+            main_logger.error(f"[get_data] Not enough data points ({len(df)}) for ticker {ticker}. Need >= 200.")
+            return pd.DataFrame()
+        
+        # Calculate technical indicators
+        try:
+            close = df["Close"].squeeze()
+            high = df["High"].squeeze()
+            low = df["Low"].squeeze()
+            vol_series = df["Volume"].squeeze()
+
+            df["SMA10"] = trend.SMAIndicator(close=close, window=10).sma_indicator()
+            df["SMA50"] = trend.SMAIndicator(close=close, window=50).sma_indicator()
+            df["RSI"] = momentum.RSIIndicator(close=close, window=14).rsi()
+            df["MACD"] = trend.MACD(close=close).macd()
+            df["ADX"] = trend.ADXIndicator(high=high, low=low, close=close, window=14).adx()
+            bollinger = volatility.BollingerBands(close=close, window=20, window_dev=2)
+            df["BB_Upper"] = bollinger.bollinger_hband()
+            df["BB_Lower"] = bollinger.bollinger_lband()
+            df["Bollinger_Width"] = bollinger.bollinger_wband()
+            df["EMA20"] = trend.EMAIndicator(close=close, window=20).ema_indicator()
+            df["VWAP"] = volume.VolumeWeightedAveragePrice(high=high, low=low, close=close, volume=vol_series, window=14).volume_weighted_average_price()
+            df["Lagged_Return"] = close.pct_change().fillna(0)
+            df["Volatility"] = volatility.AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+        except Exception as e:
+            main_logger.error(f"[get_data] Error calculating indicators for {ticker}: {e}")
+            return pd.DataFrame()
+
+        # Fill missing values
+        df.fillna(method="ffill", inplace=True)
+        df.fillna(0, inplace=True)
+
+        # Save raw CSV
+        raw_csv_file = RESULTS_DIR / f"data_fetched_{ticker}.csv"
+        try:
+            df.to_csv(raw_csv_file, index=False)
+            main_logger.info(f"[get_data] Wrote raw CSV for ticker {ticker}: {raw_csv_file}")
+        except Exception as e:
+            main_logger.error(f"[get_data] Failed to write raw CSV for {ticker}: {e}")
+            return pd.DataFrame()
+        
+        main_logger.info(f"[get_data] Successfully fetched & validated data for {ticker}. Final shape: {df.shape}")
         return df
 
-    train_tickers = ["ITC.NS", "APOLLOTYRE.NS" , "ADVENZYMES.NS", "HCLTECH.NS"]#, "EXIDEIND.NS", "KPIL.NS"]    
+    #train_tickers = ["GRINDWELL.NS", "APOLLOTYRE.NS" , "EXIDEIND.NS", "KPIL.NS"]#, "EXIDEIND.NS", "KPIL.NS"]    
+    train_tickers = [
+    # 🔹 **10 Mid-Cap Stocks** (Market Cap: ₹5,000 - ₹20,000 Cr)
+    "GRINDWELL.NS", "APOLLOTYRE.NS", "EXIDEIND.NS", "KPIL.NS",
+    #"BALKRISIND.NS", "CHOLAFIN.NS", "CROMPTON.NS", "ESCORTS.NS", "POLYCAB.NS", "WHIRLPOOL.NS",
+
+    # 🔹 **5 Large-Cap Stocks** (Market Cap: ₹50,000+ Cr)
+    #"HDFCBANK.NS", "INFY.NS", "TCS.NS", "RELIANCE.NS", "ICICIBANK.NS",
+
+    # 🔹 **5 Small-Cap Stocks** (Market Cap: Below ₹5,000 Cr)
+    "JYOTHYLAB.NS", "GABRIEL.NS", "MAHSEAMLES.NS", "GODREJIND.NS", "TATVA.NS"
+    ]
+
+    optuna_tickers = [
+    # 🔹 **10 Mid-Cap Stocks** (Market Cap: ₹5,000 - ₹20,000 Cr)
+    "ICICIBANK.NS", "APOLLOTYRE.NS", "JYOTHYLAB.NS", "KPIL.NS"
+    #"BALKRISIND.NS", "CHOLAFIN.NS", "CROMPTON.NS", "ESCORTS.NS", "POLYCAB.NS", "WHIRLPOOL.NS",
+
+    # 🔹 **5 Large-Cap Stocks** (Market Cap: ₹50,000+ Cr)
+    #"HDFCBANK.NS", "INFY.NS", "TCS.NS", "RELIANCE.NS", "ICICIBANK.NS",
+
+    # 🔹 **5 Small-Cap Stocks** (Market Cap: Below ₹5,000 Cr)
+    #"JYOTHYLAB.NS", "GABRIEL.NS", "MAHSEAMLES.NS", "GODREJIND.NS", "TATVA.NS"
+    ]
+
 
     # ----------------------------------------------------------------
     # 3. Prepare single ticker (GRINDWELL) for final testing
@@ -1688,7 +1757,7 @@ if __name__ == "__main__":
     study.optimize(
         lambda trial: objective(
             trial,
-            train_tickers=train_tickers,
+            train_tickers=optuna_tickers,
             initial_balance=100000,
             stop_loss=0.90,
             take_profit=1.10,
@@ -1698,7 +1767,7 @@ if __name__ == "__main__":
             transaction_cost=0.001
         ),
         n_trials=5,
-        n_jobs=-1
+        n_jobs=1
     )
 
     if study.best_params:
@@ -1745,7 +1814,7 @@ if __name__ == "__main__":
                 'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
                 'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
             },
-			max_episode_steps=len(df_train)
+            max_episode_steps=len(df_train)
         )
         final_envs.append(lambda e=env_instance: e)
 
@@ -1777,7 +1846,7 @@ if __name__ == "__main__":
         tensorboard_log=str(TB_LOG_DIR / "final_model")
     )
 
-    total_timesteps = 30000
+    total_timesteps = 100000
     main_logger.info(f"Learning final model for {total_timesteps} timesteps with multiple tickers.")
     model_final.learn(total_timesteps=total_timesteps)
     model_final.save("ppo_final_model.zip")
@@ -1813,7 +1882,7 @@ if __name__ == "__main__":
             'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
             'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
         },
-		max_episode_steps=len(test_df)
+        max_episode_steps=len(test_df)
     )
 
     # Create a SubprocVecEnv for normalization and load saved stats
