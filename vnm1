@@ -424,7 +424,9 @@ class SingleStockTradingEnv(gym.Env):
                 self.balance += proceeds
                 self.position -= shares_to_sell
                 self.transaction_count += 1
-        drawdown_penalty = -abs(drawdown_penalty) * 1.25
+                net_worth = float(self.balance + self.position * current_price)
+                self.peak = max(self.peak, net_worth)
+            drawdown_penalty = -abs(drawdown_penalty) * 1.25
         if current_drawdown > 0.2 and self.position > 0:
             shares_to_sell = self.position
             if shares_to_sell > 0:
@@ -433,6 +435,7 @@ class SingleStockTradingEnv(gym.Env):
                 self.position = 0
                 self.transaction_count += 1
                 self.peak = self.balance
+            drawdown_penalty = -abs(drawdown_penalty) * 1.25
 
         net_worth = float(self.balance + self.position * current_price)
         self.net_worth = net_worth
@@ -499,6 +502,24 @@ class SingleStockTradingEnv(gym.Env):
             'Trade_Cost': trade_cost,    
             'cumulative_reward': self.cumulative_reward
         })
+
+        # Store each indicator as a top-level key
+        # (Remove the ones you already have if you consider them duplicates)
+        # Now store the additional technical indicators from the DataFrame row.
+        row_data = self.df.iloc[self.current_step].copy()
+        # Remove columns that are already in your step dict (like 'Date', 'Close', etc.)
+        redundant_cols = ['Date', 'Close', 'Adj Close', 'Open', 'High', 'Low', 'Volume']
+        row_data.drop(labels=redundant_cols, errors='ignore', inplace=True)
+
+        # For example, store each technical column as a separate key:
+        indicator_cols = [
+            "SMA10", "SMA50", "RSI", "MACD", "ADX",
+            "BB_Upper", "BB_Lower", "Bollinger_Width",
+            "EMA20", "VWAP", "Lagged_Return", "Volatility"
+        ]
+        for col in indicator_cols:
+            # Prefix with 'Indicator_' if you like, or just use col
+            self.history[-1][col] = row_data[col]
 
         # --- Revised Termination Condition ---
         # Ensure a minimum number of steps before termination.                
@@ -1443,7 +1464,7 @@ def objective(
     callback_list = CallbackList([custom_callback, checkpoint_callback, early_stopping_callback])
     
     # === PPO Training ===
-    total_timesteps = 5000
+    total_timesteps = 4000
     start_time = time.time()
     main_logger.info(f"[Trial {trial.number}] Starting PPO training with {total_timesteps} timesteps.")
     try:
@@ -1688,14 +1709,13 @@ if __name__ == "__main__":
         main_logger.info(f"[get_data] Successfully fetched & validated data for {ticker}. Final shape: {df.shape}")
         return df
 
-    #train_tickers = ["GRINDWELL.NS", "APOLLOTYRE.NS" , "EXIDEIND.NS", "KPIL.NS"]#, "EXIDEIND.NS", "KPIL.NS"]    
     train_tickers = [
     # 🔹 **10 Mid-Cap Stocks** (Market Cap: ₹5,000 - ₹20,000 Cr)
-    "GRINDWELL.NS", "APOLLOTYRE.NS", "EXIDEIND.NS", "KPIL.NS",
+    "GRINDWELL.NS", "APOLLOTYRE.NS", "EXIDEIND.NS", "KPIL.NS", "ICICIBANK.NS",
     #"BALKRISIND.NS", "CHOLAFIN.NS", "CROMPTON.NS", "ESCORTS.NS", "POLYCAB.NS", "WHIRLPOOL.NS",
 
     # 🔹 **5 Large-Cap Stocks** (Market Cap: ₹50,000+ Cr)
-    #"HDFCBANK.NS", "INFY.NS", "TCS.NS", "RELIANCE.NS", "ICICIBANK.NS",
+    "HDFCBANK.NS", "INFY.NS", "TCS.NS", "RELIANCE.NS", #"ICICIBANK.NS",
 
     # 🔹 **5 Small-Cap Stocks** (Market Cap: Below ₹5,000 Cr)
     "JYOTHYLAB.NS", "GABRIEL.NS", "MAHSEAMLES.NS", "GODREJIND.NS", "TATVA.NS"
@@ -1703,21 +1723,21 @@ if __name__ == "__main__":
 
     optuna_tickers = [
     # 🔹 **10 Mid-Cap Stocks** (Market Cap: ₹5,000 - ₹20,000 Cr)
-    "ICICIBANK.NS", "APOLLOTYRE.NS", "JYOTHYLAB.NS", "KPIL.NS"
+    "ICICIBANK.NS", "APOLLOTYRE.NS", "JYOTHYLAB.NS", "KPIL.NS",
     #"BALKRISIND.NS", "CHOLAFIN.NS", "CROMPTON.NS", "ESCORTS.NS", "POLYCAB.NS", "WHIRLPOOL.NS",
 
     # 🔹 **5 Large-Cap Stocks** (Market Cap: ₹50,000+ Cr)
     #"HDFCBANK.NS", "INFY.NS", "TCS.NS", "RELIANCE.NS", "ICICIBANK.NS",
 
     # 🔹 **5 Small-Cap Stocks** (Market Cap: Below ₹5,000 Cr)
-    #"JYOTHYLAB.NS", "GABRIEL.NS", "MAHSEAMLES.NS", "GODREJIND.NS", "TATVA.NS"
+    "CROMPTON.NS", "GABRIEL.NS", "MAHSEAMLES.NS", "GODREJIND.NS", "TATVA.NS"
     ]
 
 
     # ----------------------------------------------------------------
     # 3. Prepare single ticker (GRINDWELL) for final testing
     # ----------------------------------------------------------------
-    test_ticker = "ITC.NS"
+    """ test_ticker = "ITC.NS"
     df_test_full = get_data(test_ticker, "2018-01-01", "2025-02-05")
     if df_test_full.empty:
         main_logger.error(f"No data for test ticker {test_ticker}. Exiting.")
@@ -1725,7 +1745,7 @@ if __name__ == "__main__":
 
     split_idx_test = int(len(df_test_full) * 0.8)
     test_df = df_test_full.iloc[split_idx_test:].reset_index(drop=True)
-    main_logger.info(f"{test_ticker} test portion rows = {len(test_df)}")
+    main_logger.info(f"{test_ticker} test portion rows = {len(test_df)}") """
 
     # ----------------------------------------------------------------
     # 4. Basic config + Setup Optuna
@@ -1766,7 +1786,7 @@ if __name__ == "__main__":
             annual_trading_days=252,
             transaction_cost=0.001
         ),
-        n_trials=5,
+        n_trials=10,
         n_jobs=1
     )
 
@@ -1854,88 +1874,106 @@ if __name__ == "__main__":
     main_logger.info("Final multi‐ticker model + VecNormalize saved.")
 
     # ----------------------------------------------------------------
-    # 6. Test on single ticker (GRINDWELL) with saved normalization and save test history to CSV
+    # 6. Test on multiple tickers with saved normalization and save test history to CSV
     # ----------------------------------------------------------------
-    main_logger.info(f"Testing final model on ticker {test_ticker} with {len(test_df)} rows of data.")
 
-    env_test = SingleStockTradingEnv(
-        df=test_df,
-        ticker=test_ticker,
-        initial_balance=INITIAL_BALANCE,
-        stop_loss=best_params.get('stop_loss', STOP_LOSS),
-        take_profit=best_params.get('take_profit', TAKE_PROFIT),
-        max_position_size=best_params.get('max_position_size', MAX_POSITION_SIZE),
-        max_drawdown=best_params.get('max_drawdown', MAX_DRAWDOWN),
-        annual_trading_days=ANNUAL_TRADING_DAYS,
-        transaction_cost=best_params.get('transaction_cost', TRANSACTION_COST),
-        env_rank=9999,
-        some_factor=best_params.get('drawdown_penalty_factor', 0.01),
-        hold_threshold=best_params.get('hold_threshold', 0.1),
-        reward_weights={
-            'reward_scale': best_params.get('reward_scale', 1.0),
-            'profit_weight': best_params.get('profit_weight', 1.5),
-            'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
-            'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
-            'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
-            'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
-            'volatility_threshold': best_params.get('volatility_threshold', 1.0),
-            'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
-            'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
-        },
-        max_episode_steps=len(test_df)
-    )
+    test_tickers = ["KOTAKBANK.NS", "ITC.NS", "ASIANPAINT.NS", "AXISBANK.NS", "LT.NS", "NTPC.NS", "SBIN.NS"]  # Or whichever tickers
 
-    # Create a SubprocVecEnv for normalization and load saved stats
-    from stable_baselines3.common.vec_env import SubprocVecEnv
-    test_vec = SubprocVecEnv([lambda: env_test])
-    test_vec = VecNormalize.load("vec_normalize.pkl", test_vec)
-    test_vec.training = False
-    test_vec.norm_reward = False
-    
-    # Load the final PPO model using the test vectorized environment (which has the normalization stats)
-    loaded_model = PPO.load("ppo_final_model.zip", env=test_vec)
+    for test_ticker in test_tickers:
+        main_logger.info(f"Preparing test data for ticker {test_ticker}.")
 
-    # Reset the vectorized test environment
-    obs = test_vec.reset()  # note: test_vec.reset() returns the normalized observation(s)
-    done = [False] * test_vec.num_envs
-    steps_taken = 0
-    max_test_steps = len(test_df)
-    rl_test_history = []  # List to collect history entries
+        # 1) Get the DataFrame for this ticker.
+        df_test_full = get_data(test_ticker, "2018-01-01", "2025-02-05")
+        if df_test_full.empty:
+            main_logger.error(f"No data for test ticker {test_ticker}. Skipping inference.")
+            continue
 
-    # Prediction loop remains the same:
-    while not all(done) and steps_taken < max_test_steps:
-        action, _ = loaded_model.predict(obs, deterministic=True)
-        obs, rewards, done, infos = test_vec.step(action)
-        steps_taken += 1
-        if steps_taken % 100 == 0:
-            training_logger.info(f"[Test Ticker] Step {steps_taken}: Action = {action}, Rewards = {rewards}")
+        split_idx_test = int(len(df_test_full) * 0.8)
+        test_df = df_test_full.iloc[split_idx_test:].reset_index(drop=True)
+        main_logger.info(f"{test_ticker} test portion rows = {len(test_df)}")
 
-    # After the loop, retrieve the history from the vectorized environment.
-    # --- After finishing the prediction loop, retrieve final metrics ---
-    final_metrics_list = test_vec.env_method("get_final_metrics")
-    if final_metrics_list and len(final_metrics_list) > 0:
-        # Since we are using a single test environment, take the first element.
-        final_metrics = final_metrics_list[0]
-        rl_test_history = final_metrics.get("history", [])
-        if rl_test_history:
-            final_net_worth = final_metrics.get("net_worth", None)
-            if final_net_worth is not None:
-                main_logger.info(f"Test complete on {test_ticker}. Final net worth: ${final_net_worth:.2f}")
-            else:
-                main_logger.warning("Final net worth is not available in the metrics.")
-        else:
-            main_logger.warning("No test history recorded in final metrics.")
-            rl_test_history = []
-    else:
-        main_logger.warning("No final metrics retrieved from the test environment.")
+        # 2) Create and wrap environment
+        env_test = SingleStockTradingEnv(
+            df=test_df,
+            ticker=test_ticker,
+            initial_balance=INITIAL_BALANCE,
+            stop_loss=best_params.get('stop_loss', STOP_LOSS),
+            take_profit=best_params.get('take_profit', TAKE_PROFIT),
+            max_position_size=best_params.get('max_position_size', MAX_POSITION_SIZE),
+            max_drawdown=best_params.get('max_drawdown', MAX_DRAWDOWN),
+            annual_trading_days=ANNUAL_TRADING_DAYS,
+            transaction_cost=best_params.get('transaction_cost', TRANSACTION_COST),
+            env_rank=9999,
+            some_factor=best_params.get('drawdown_penalty_factor', 0.01),
+            hold_threshold=best_params.get('hold_threshold', 0.1),
+            reward_weights={
+                'reward_scale': best_params.get('reward_scale', 1.0),
+                'profit_weight': best_params.get('profit_weight', 1.5),
+                'sharpe_bonus_weight': best_params.get('sharpe_bonus_weight', 0.05),
+                'transaction_penalty_weight': best_params.get('transaction_penalty_weight', 1e-3),
+                'holding_bonus_weight': best_params.get('holding_bonus_weight', 0.001),
+                'transaction_penalty_scale': best_params.get('transaction_penalty_scale', 1.0),
+                'volatility_threshold': best_params.get('volatility_threshold', 1.0),
+                'momentum_threshold_min': best_params.get('momentum_threshold_min', 30),
+                'momentum_threshold_max': best_params.get('momentum_threshold_max', 70)
+            },
+            max_episode_steps=len(test_df)
+        )
+
+        from stable_baselines3.common.vec_env import SubprocVecEnv
+        test_vec = SubprocVecEnv([lambda: env_test])
+        test_vec = VecNormalize.load("vec_normalize.pkl", test_vec)
+        test_vec.training = False
+        test_vec.norm_reward = False
+
+        # 3) Load final model
+        loaded_model = PPO.load("ppo_final_model.zip", env=test_vec)
+
+        main_logger.info(f"Testing final model on ticker {test_ticker} with {len(test_df)} rows of data.")
+
+        # 4) Run inference
+        obs = test_vec.reset()
+        done = [False] * test_vec.num_envs
+        steps_taken = 0
+        max_test_steps = len(test_df)
         rl_test_history = []
 
-    # Convert history to a DataFrame and save to CSV
-    rl_test_df = pd.DataFrame(rl_test_history)
-    test_history_file = RESULTS_DIR / "test_env_history.csv"
-    if not rl_test_df.empty:
-        rl_test_df.to_csv(test_history_file, index=False)
-        main_logger.info(f"Testing environment history saved to {test_history_file}")
-    else:
-        pd.DataFrame().to_csv(test_history_file, index=False)
-        main_logger.warning(f"Testing environment history was empty. Saved empty CSV at {test_history_file}")
+        while not all(done) and steps_taken < max_test_steps:
+            action, _ = loaded_model.predict(obs, deterministic=True)
+            obs, rewards, done, infos = test_vec.step(action)
+            steps_taken += 1
+            if steps_taken % 100 == 0:
+                training_logger.info(f"[Test Ticker={test_ticker}] Step {steps_taken}: Action={action}, Rewards={rewards}")
+
+        # 5) Retrieve the RL agent’s final metrics & history
+        final_metrics_list = test_vec.env_method("get_final_metrics")
+        if final_metrics_list and len(final_metrics_list) > 0:
+            final_metrics = final_metrics_list[0]
+            rl_test_history = final_metrics.get("history", [])
+            if rl_test_history:
+                final_net_worth = final_metrics.get("net_worth", None)
+                if final_net_worth is not None:
+                    main_logger.info(f"Test complete on {test_ticker}. Final net worth: ${final_net_worth:.2f}")
+                else:
+                    main_logger.warning(f"Final net worth is not available in the metrics for {test_ticker}.")
+            else:
+                main_logger.warning(f"No test history recorded in final metrics for {test_ticker}.")
+                rl_test_history = []
+        else:
+            main_logger.warning(f"No final metrics retrieved from the test environment for {test_ticker}.")
+            rl_test_history = []
+
+        # 6) Directly convert the environment’s step-by-step history to DataFrame
+        #    (No flatten needed, because we already store indicators & fields top-level.)
+        test_history_file = RESULTS_DIR / f"test_env_history_{test_ticker}.csv"
+        if rl_test_history:
+            # Optionally remove "Observation" from each step if it’s included but not needed
+            for step_record in rl_test_history:
+                step_record.pop("Observation", None)
+
+            rl_test_df = pd.DataFrame(rl_test_history)
+            rl_test_df.to_csv(test_history_file, index=False)
+            main_logger.info(f"Testing environment history for {test_ticker} saved to {test_history_file}")
+        else:
+            pd.DataFrame().to_csv(test_history_file, index=False)
+            main_logger.warning(f"Test history was empty for {test_ticker}. Saved empty CSV at {test_history_file}")
